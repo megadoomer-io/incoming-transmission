@@ -8,6 +8,9 @@ set -euo pipefail
 PLIST_NAME="com.telegram.bridge"
 PLIST_SOURCE="$HOME/.telegram-bridge/$PLIST_NAME.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+WATCHDOG_NAME="com.telegram.watchdog"
+WATCHDOG_SOURCE="$HOME/.telegram-bridge/$WATCHDOG_NAME.plist"
+WATCHDOG_DEST="$HOME/Library/LaunchAgents/$WATCHDOG_NAME.plist"
 STATE_DIR="$HOME/.local/state/telegram-bridge"
 STATE_FILE="$STATE_DIR/state.json"
 LOG_FILE="$STATE_DIR/router.log"
@@ -25,6 +28,37 @@ seed_state() {
             > "$STATE_FILE"
         echo "Seeded $STATE_FILE (allowed_username=${ALLOWED_USERNAME:-null})"
     fi
+}
+
+# Read a top-level string field from state.json ("" if missing/null/unreadable).
+state_field() {
+    [ -f "$STATE_FILE" ] || { echo ""; return; }
+    /usr/bin/python3 - "$STATE_FILE" "$1" <<'PY' 2>/dev/null || echo ""
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    v = None
+print(v if v is not None else "")
+PY
+}
+
+# Refuse to start the daemon with no owner identity configured. If the bridge
+# boots with allowed_username=null AND allowed_user_id=null, the FIRST person to
+# message the bot claims it (bootstrap-hijack window). Require either the env var
+# (which seeds the username) or an already-bootstrapped state file. This narrows
+# the claim window to "you set your handle, then you message the bot".
+require_owner_lock() {
+    # Already bootstrapped (a user id is captured) -> locked, fine.
+    [ -n "$(state_field allowed_user_id)" ] && return 0
+    # Username configured via env (seeds state) or already in state -> fine.
+    [ -n "$ALLOWED_USERNAME" ] && return 0
+    [ -n "$(state_field allowed_username)" ] && return 0
+    echo "Error: refusing to start with no owner lock." >&2
+    echo "Set TELEGRAM_BRIDGE_ALLOWED_USERNAME to your Telegram handle before" >&2
+    echo "starting, so only you can claim the bridge. Otherwise the first person" >&2
+    echo "to message the bot would become the owner." >&2
+    return 1
 }
 
 cmd_start() {
@@ -48,14 +82,60 @@ cmd_start() {
 
     seed_state
     mkdir -p "$STATE_DIR"
+    require_owner_lock || return 1
 
     sed -e "s|__HOME__|$HOME|g" \
         -e "s|__STATE_DIR__|$STATE_DIR|g" \
         -e "s|__TOKEN__|$token|g" \
         "$PLIST_SOURCE" > "$PLIST_DEST"
+    # The rendered plist contains the bot token in plaintext. Lock it down so it
+    # isn't world/group readable (LaunchAgents land 644 by default). A better fix
+    # is to keep the token out of the plist entirely (see README Security notes);
+    # chmod 600 is the accepted minimum until then.
+    chmod 600 "$PLIST_DEST"
 
     launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
     echo "telegram-bridge started"
+}
+
+cmd_watchdog_start() {
+    if launchctl list "$WATCHDOG_NAME" &>/dev/null; then
+        echo "telegram watchdog is already running"
+        return 0
+    fi
+    if [ ! -f "$WATCHDOG_SOURCE" ]; then
+        echo "Error: watchdog plist template not found at $WATCHDOG_SOURCE" >&2
+        echo "Run ./install.sh from the incoming-transmission repo first." >&2
+        return 1
+    fi
+    local token="${TELEGRAM_BRIDGE_BOT_TOKEN:-}"
+    if [ -z "$token" ]; then
+        echo "Error: TELEGRAM_BRIDGE_BOT_TOKEN not set." >&2
+        echo "Set TELEGRAM_BRIDGE_BOT_TOKEN before starting the watchdog." >&2
+        return 1
+    fi
+    mkdir -p "$STATE_DIR"
+
+    sed -e "s|__HOME__|$HOME|g" \
+        -e "s|__STATE_DIR__|$STATE_DIR|g" \
+        -e "s|__TOKEN__|$token|g" \
+        "$WATCHDOG_SOURCE" > "$WATCHDOG_DEST"
+    # Same as the bridge plist: the token is rendered in plaintext, so 600 it.
+    chmod 600 "$WATCHDOG_DEST"
+
+    launchctl bootstrap "gui/$(id -u)" "$WATCHDOG_DEST"
+    echo "telegram watchdog started"
+}
+
+cmd_watchdog_stop() {
+    if ! launchctl list "$WATCHDOG_NAME" &>/dev/null; then
+        echo "telegram watchdog is not running"
+        rm -f "$WATCHDOG_DEST"
+        return 0
+    fi
+    launchctl bootout "gui/$(id -u)/$WATCHDOG_NAME"
+    rm -f "$WATCHDOG_DEST"
+    echo "telegram watchdog stopped"
 }
 
 cmd_stop() {
@@ -123,12 +203,14 @@ cmd_help() {
 Usage: telegram-bridge <command>
 
 Commands:
-  start    Start the router daemon (launchd)
-  stop     Stop the router daemon
-  restart  Stop then start
-  status   Show daemon status, owner, chat id, attached topics
-  log      Tail the router log
-  help     Show this help message
+  start           Start the router daemon (launchd)
+  stop            Stop the router daemon
+  restart         Stop then start
+  status          Show daemon status, owner, chat id, attached topics
+  log             Tail the router log
+  watchdog-start  Start the wedge watchdog (renders + loads its launchd plist)
+  watchdog-stop   Stop the wedge watchdog
+  help            Show this help message
 
 First run: set TELEGRAM_BRIDGE_ALLOWED_USERNAME to lock the bridge to your
 Telegram username, then `telegram-bridge start` and send the bot any message
@@ -137,12 +219,14 @@ EOF
 }
 
 case "${1:-help}" in
-    start)   cmd_start ;;
-    stop)    cmd_stop ;;
-    restart) cmd_restart ;;
-    status)  cmd_status ;;
-    log)     cmd_log ;;
-    help)    cmd_help ;;
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        cmd_restart ;;
+    status)         cmd_status ;;
+    log)            cmd_log ;;
+    watchdog-start) cmd_watchdog_start ;;
+    watchdog-stop)  cmd_watchdog_stop ;;
+    help)           cmd_help ;;
     *)
         echo "Unknown command: $1" >&2
         cmd_help >&2

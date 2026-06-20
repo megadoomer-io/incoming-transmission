@@ -31,14 +31,25 @@ echo
 mkdir -p "$PREFIX" "$BIN_DIR" "$STATE_DIR"
 
 # 1. Runtime code + configs (everything except *.template / *.example).
+#    Note the glob excludes *.example.txt and *.example.json — the preamble and
+#    dir-alias examples are seeded to their live names below, only if absent.
 for f in "$REPO_DIR"/runtime/*; do
     base="$(basename "$f")"
     case "$base" in
-        *.template|*.example) continue ;;
+        *.template|*.example|*.example.txt|*.example.json) continue ;;
     esac
     cp "$f" "$PREFIX/$base"
     echo "installed $PREFIX/$base"
 done
+
+# 1b. Make installed runtime scripts executable. They are invoked directly
+#     (telegram-spawn.sh, poll-render.sh, the .py hooks/servers run via their
+#     shebangs), so the +x bit must survive the copy regardless of the source
+#     file's mode in the checkout.
+for s in "$PREFIX"/*.sh "$PREFIX"/*.py; do
+    [ -f "$s" ] && chmod +x "$s"
+done
+echo "chmod +x runtime scripts in $PREFIX"
 
 # 2. Render the MCP config from its template (path + uv binary are absolute).
 sed -e "s|__HOME__|$HOME|g" -e "s|__UV__|$UV_BIN|g" \
@@ -53,6 +64,19 @@ if [ ! -f "$PREFIX/dir-aliases.json" ]; then
 else
     echo "kept existing $PREFIX/dir-aliases.json"
 fi
+
+# 3b. Seed the operator-style preamble files from their examples, only if absent.
+#     These are the "Customizing agent behavior" seam: empty by default (the
+#     examples are all comments), so a default install behaves like normal Claude
+#     plus transport mechanics. Edit them to layer in your own style.
+for p in spawn-preamble bridge-preamble; do
+    if [ ! -f "$PREFIX/$p.txt" ]; then
+        cp "$REPO_DIR/runtime/$p.example.txt" "$PREFIX/$p.txt"
+        echo "seeded $PREFIX/$p.txt (empty by default; edit to customize behavior)"
+    else
+        echo "kept existing $PREFIX/$p.txt"
+    fi
+done
 
 # 4. Control CLI + SessionStart hook.
 cp "$REPO_DIR/bin/telegram-bridge" "$BIN_DIR/telegram-bridge"
@@ -85,8 +109,16 @@ Done. Next steps (not automated — you stay in control):
    - (optional) Tier-2 permission hook for unattended spawns
    - (optional) AskUserQuestion MCP from $PREFIX/telegram-auq-mcp.json
 
-6. (optional) Start the wedge watchdog:
-     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.telegram.watchdog.plist
+6. (optional) Start the wedge watchdog (renders its plist + loads it, like the
+   router; needs TELEGRAM_BRIDGE_BOT_TOKEN in the env):
+     telegram-bridge watchdog-start
 
 7. In any Claude Code session, run /telegram to attach it to a topic.
+
+8. (optional) Customize agent behavior. By default the bridge injects only
+   transport mechanics. To layer in your own operator style, edit:
+     $PREFIX/spawn-preamble.txt   (for unattended /new spawns)
+     $PREFIX/bridge-preamble.txt  (for bridged, human-in-the-loop sessions)
+   Both ship empty (all comments) so default behavior is normal Claude. See the
+   README "Customizing agent behavior" section.
 EOF
