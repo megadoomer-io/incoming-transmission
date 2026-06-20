@@ -43,6 +43,18 @@ documented, user-amendable seam (default = normal Claude).
 - **README "Philosophy: transport, not workflow opinion" and "Customizing agent
   behavior" sections (H4)**, plus a "Known issues" section.
 
+### Fixed
+- **`/new` spawns now wire in the AskUserQuestion MCP (#1).** `telegram-spawn.sh`
+  passes `--mcp-config <auq config>` to the spawned `claude` when the rendered
+  config exists, so an unattended spawn that has native AUQ disabled gets the
+  Telegram button-based AUQ as its replacement. Previously a spawn disabled native
+  AUQ but wired no substitute, so it could not ask the owner anything unless the
+  user had separately added the MCP to their global settings. The flag is added
+  only when `~/.telegram-bridge/telegram-auq-mcp.json` exists (the MCP is
+  optional), so installs without it are unaffected. The launch flags are now
+  collected in one `CLAUDE_FLAGS` array shared by both tmux branches instead of
+  being duplicated.
+
 ### Security
 - **Plist token hardening (C3).** `telegram-bridge start` / `watchdog-start` now
   `chmod 600` the rendered launchd plists right after the sed render (they contain

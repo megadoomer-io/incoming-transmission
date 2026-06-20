@@ -28,6 +28,7 @@ set -euo pipefail
 TMUX_BIN="${TELEGRAM_BRIDGE_TMUX:-/opt/homebrew/bin/tmux}"
 CLAUDE_BIN="${TELEGRAM_BRIDGE_CLAUDE:-/opt/homebrew/bin/claude}"
 ALIAS_FILE="${TELEGRAM_BRIDGE_DIR_ALIASES:-$HOME/.telegram-bridge/dir-aliases.json}"
+AUQ_MCP_CONFIG="${TELEGRAM_BRIDGE_AUQ_MCP_CONFIG:-$HOME/.telegram-bridge/telegram-auq-mcp.json}"
 
 # Attach (compaction-replacement) mode is requested EXPLICITLY via flags, never
 # inherited from the environment. A session spawned for compaction exports
@@ -218,24 +219,38 @@ if [ -n "$RESTORE_FILE" ]; then
     ENV_ARGS+=(-e "TELEGRAM_BRIDGE_RESTORE_FILE=$RESTORE_FILE")
 fi
 
+# Claude launch flags, shared by both tmux branches below.
+#   --*-skip-permissions : an unattended spawn must not block on the native
+#                          permission prompt (no human at the pane to answer it).
+#   --disallowedTools AskUserQuestion : native AUQ would render a blocking picker
+#                          into the detached pane; disable it.
+#   --mcp-config <auq>   : wire in the optional Telegram AUQ MCP so the session
+#                          can still ask the owner via phone buttons (the
+#                          supported substitute for the disabled native AUQ).
+#                          Added ONLY if the rendered config exists — the MCP is
+#                          optional (needs uv + the mcp package). Absent config =
+#                          skip it: the spawn still works, the session just can't
+#                          ask questions. Without this flag a spawn had native AUQ
+#                          disabled AND no replacement, so it could not ask at all.
+CLAUDE_FLAGS=(
+    --allow-dangerously-skip-permissions
+    --dangerously-skip-permissions
+    --disallowedTools AskUserQuestion
+)
+if [ -f "$AUQ_MCP_CONFIG" ]; then
+    CLAUDE_FLAGS+=(--mcp-config "$AUQ_MCP_CONFIG")
+fi
+
 if "$TMUX_BIN" has-session -t "=$SHARED" 2>/dev/null; then
     # Target "=$SHARED:" — the EXACT session, trailing colon = "pick the next
     # free window index". A bare "-t $SHARED" makes new-window target index 0,
     # which fails ("create window failed: index 0 in use") once the session
     # already has a window 0 (base-index is 0).
     "$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" "${ENV_ARGS[@]}" \
-        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" \
-            --allow-dangerously-skip-permissions \
-            --dangerously-skip-permissions \
-            --disallowedTools AskUserQuestion \
-            -- "$prompt"
+        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
 else
     "$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" "${ENV_ARGS[@]}" \
-        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" \
-            --allow-dangerously-skip-permissions \
-            --dangerously-skip-permissions \
-            --disallowedTools AskUserQuestion \
-            -- "$prompt"
+        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
 fi
 
 echo "telegram-spawn: launched window '$win' in session $SHARED (dir: $dir)"
