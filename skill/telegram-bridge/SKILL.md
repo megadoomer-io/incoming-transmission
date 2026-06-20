@@ -11,31 +11,39 @@ in that topic on your phone routes to *this* live session (full context, MCP, ho
 and the session replies in the topic. Multiple sessions can attach concurrently —
 each gets its own topic in the same group, like tabs.
 
-Replies come from the **real session** (a session-scoped cron processes messages
-in-session), not a `claude -p --bare` subagent.
+Replies come from the **real session** (it processes messages in-session, with
+full context), not a `claude -p --bare` subagent.
 
 ## Architecture (how the pieces fit)
 
+Smart router, dumb session: the router daemon owns all timing (routing, push
+delivery, the context gauge, and compaction triggering); the session just drains
+its inbox when nudged.
+
 ```
 Phone topic ──> router daemon (sole getUpdates reader) ──> this session's inbox.jsonl
-                                                                  │
-                          session-scoped cron (idle) reads inbox ─┘
-                                  │ processes in-session, replies
-Phone topic <── telegram-send.sh ─┘
+                     │  send-keys "drain now" nudge ──────────────┐
+                     │  context_loop thread: gauge + compaction    │
+                     ▼                                             ▼
+              status.json / sticky pin              session drains inbox, replies
+Phone topic <────────────────────── telegram-send.sh ◀────────────┘
 ```
 
 - **Router daemon** (`telegram-bridge`, launchd) is the ONLY process that reads
   Telegram (getUpdates is single-consumer). It routes each message by
-  `message_thread_id` to `/tmp/claude-telegram/sessions/<thread_id>/inbox.jsonl`.
-- **This skill** creates the topic, registers ownership, and starts a session-scoped
-  `CronCreate` poll that drains the inbox and replies. The cron fires on idle, so an
-  incoming message waits until the session finishes its current work (it won't
-  interrupt a running task).
+  `message_thread_id` to `/tmp/claude-telegram/sessions/<thread_id>/inbox.jsonl`,
+  then **pushes** the session a one-line drain nudge (`send-keys`). A separate
+  `context_loop` thread computes each session's context gauge and triggers
+  compaction — all OFF the getUpdates path.
+- **This skill** creates the topic, registers ownership, does an initial drain, and
+  starts ONE slow **fallback heartbeat** cron (for a missed push). The session has
+  no fast poll cron and no backoff ladder — it reacts to the router's push, falling
+  back to the heartbeat. Processing is in-session, so an incoming message waits until
+  the session finishes its current work (it won't interrupt a running task).
 - **Watchdog daemon** (`telegram-watchdog`, a separate launchd timer) is the safety
-  net for the failure the poll cron *can't* catch: a session wedged on an
-  interactive prompt nobody can answer. A blocked session can't run its own poll, so
-  an independent watcher scans the tmux panes and alerts the owner. See "Wedge
-  watchdog" below.
+  net for the failure push/heartbeat *can't* catch: a session wedged on an
+  interactive prompt nobody can answer. An independent watcher scans the tmux panes
+  and alerts the owner. See "Wedge watchdog" below.
 
 ## When to Use
 
@@ -200,39 +208,41 @@ done
 Only after the lock is gone (or was never present) do you start your poll cron in
 Step 4 — this guarantees the old and new pollers never run at the same time.
 
-### Step 4: Start the session-scoped poll (CronCreate)
+### Step 4: Start the fallback heartbeat (CronCreate) + initial drain
 
-The poll prompt is maintained as a single-source template at
-`~/.telegram-bridge/poll-prompt.tmpl` (the prompt's own backoff step re-renders
-from it, so it must not be duplicated inline). Render it for THIS session, then
-create the cron with the rendered text:
+In the smart-router / dumb-session model the **router** pushes you a wake nudge
+the moment a message arrives, and computes your context gauge itself. So this
+session does NOT run a fast poll cron — it starts ONE slow **fallback heartbeat**
+cron (for the rare missed wake) and then does an initial drain so the drain
+procedure is in context for the first wake nudge.
+
+The heartbeat prompt is a single-source template at
+`~/.telegram-bridge/poll-prompt.tmpl`. Render it for THIS session, then create
+one cron with the rendered text:
 
 1. Render the prompt (substitutes this session's IDs/paths):
    ```bash
    ~/.telegram-bridge/poll-render.sh "$THREAD_ID" "$CHAT_ID" "$INBOX" "$PWD"
    ```
    Capture stdout — that is the prompt.
-2. `CronCreate` a recurring job at the **fastest rung** (every minute, cron
-   `* * * * *`) with that prompt (`recurring: true`, `durable: false`). It runs
-   **in this session**, so replies carry full context. The cron fires on idle, so
-   an incoming message waits until the session finishes its current work.
-3. Record poll state so backoff + the handoff can find the cron (substitute the
-   new cron id returned by CronCreate):
+2. Read `heartbeat_seconds` from `~/.telegram-bridge/compaction.json` (default
+   1800 = 30m) and turn it into a cron expression: `*/<minutes> * * * *` where
+   `minutes = max(1, round(heartbeat_seconds / 60))`. `CronCreate` ONE recurring
+   job at that interval with the rendered prompt (`recurring: true`,
+   `durable: false`). It runs **in this session**, so replies carry full context.
+   There is no backoff ladder and no rescheduling — one fixed slow heartbeat.
+3. Record the cron id so the handoff can find it:
    ```bash
    SESS=/tmp/claude-telegram/sessions/$THREAD_ID
    echo "<new cron id>" > "$SESS/poll.cron.id"
-   echo 0 > "$SESS/idle.count"
-   echo 0 > "$SESS/poll.level"
    ```
+4. Do an initial drain now (run section A of the rendered prompt) so any backlog
+   is handled and the drain procedure is in context before the first wake nudge.
 
-The cron then self-adjusts its interval (see "Context gauge, backoff &
-auto-compaction" below): fast (60s) while a conversation is active, ramping to a
-slow cap (default 30m) after sustained idleness, so an idle session no longer
-climbs to auto-compaction purely from poll-prompt re-injection.
-
-Report to the user: the topic name, that it's live (with the context gauge,
-adaptive backoff, and auto-compaction at the configured threshold), and to type in
-that topic on their phone.
+Report to the user: the topic name, that it's live (router-driven push delivery,
+a ~30m fallback heartbeat, router-computed context gauge, and router-driven
+auto-compaction at the configured threshold), and to type in that topic on their
+phone.
 
 ## Commands (typed by the user in the topic)
 
@@ -270,58 +280,59 @@ and records an `image_path` on the message; the session `Read`s the image and
 treats the caption as the instruction. Handy for showing an error or UI state
 from your phone instead of typing it out.
 
-## Context gauge, backoff, wake & auto-compaction
+## Context gauge, push delivery & auto-compaction (smart router / dumb session)
 
 The phone can't see Claude Code's status bar, so the bridge surfaces context
-occupancy two ways, backs off polling when the session is idle, and rolls a
-filling session over automatically.
+occupancy on a pinned sticky, delivers messages by pushing the session, and rolls
+a filling session over automatically. In this model the **router owns all timing**
+— the session is a "dumb" processor that drains when nudged.
 
 **Status sticky.** Each topic has a pinned message the router keeps updated:
 `cwd · N msgs · ~XX% ctx · updated HH:MM`, with a ⚠️ once context passes the warn
-threshold. The numbers come from the session's own transcript (the poll cron runs
-`telegram-context.py` each tick and writes `status.json`; the router reads it and
-edits the pin). Window detection is automatic — the Opus 1m variant gets a
+threshold. The **router** computes the numbers itself: a daemon thread
+(`context_loop`) runs `telegram-context.py` against each session's transcript on a
+fixed interval (`context_interval_seconds`, default 90s), writes `status.json`, and
+the main loop edits the pin. This runs OFF the getUpdates path, so a large
+transcript scan can't stall message routing. The session no longer touches
+`status.json`. Window detection is automatic — the Opus 1m variant gets a
 1,000,000-token window, everything else 200,000, with a fallback to 1m if observed
-tokens already exceed 200k (so a session whose model id lacks the `[1m]` suffix
-isn't mis-scored).
+tokens already exceed 200k.
 
-**Backoff.** An idle session is not free: each poll tick re-injects the poll
-prompt into context, so fixed 1-minute polling climbs to the auto-compaction
-trigger in ~3 hours even with an empty inbox. The poll prompt is self-rescheduling
-(section D): it tracks consecutive idle ticks in `SESS/idle.count` and walks an
-interval ladder (`polling.idle_intervals_seconds`, default `[60,120,300,1800]` =
-1/2/5/30m, advancing one rung every `polling.ticks_per_rung` idle ticks, both in
-`compaction.json`). When a rung changes it CronCreates a new cron at the new
-interval, records the id in `SESS/poll.cron.id`, then CronDeletes the old one
-(create-before-delete, so there's never a gap). Any tick that drains a message
-resets to the fastest rung, so an active conversation stays at 60s. Worst-case
-latency for the first message after deep idle is the cap (30m) when wake is
-unavailable; with wake (below) the message drains immediately.
+**Push delivery (the primary path).** When the router routes a message to a topic,
+it finds that session's tmux pane by pid identity (registry `claude_pid` equals the
+pane's `#{pane_pid}` or an ancestor) and `send-keys` a one-line **drain** nudge:
+"run section A of your heartbeat prompt." The session drains + replies. The nudge is
+a drain IMPERATIVE only — it never carries the message payload (that always travels
+via the inbox), so a nudge can't be mistaken for task content. Push is best-effort:
+it runs only AFTER the message is in the inbox and is wrapped so any failure is
+logged and ignored, so it can never drop or delay delivery. The pane match is by pid
+identity (never name/cwd), so a nudge reaches only the exact session that owns the
+topic. Lives in `telegram-router.py` (`wake_session`, `_nudge_pane`,
+`_pane_for_claude_pid`).
 
-**Wake.** Backoff trades latency for cost; wake buys the latency back. When the
-router delivers a message to a topic, it finds that session's tmux pane by pid
-identity (the registry `claude_pid` equals the pane's `#{pane_pid}` or an ancestor
-of it) and `send-keys` a one-line nudge telling the session to run a full poll
-tick now. The session drains + replies at once and backoff resets, so a backed-off
-cron never sits on a message. Wake is best-effort and additive: it runs in the
-router only AFTER the message is in the inbox and is wrapped so any failure is
-logged and ignored, so it can never drop or delay delivery. The pane match is by
-pid identity (never name or cwd), so a nudge can only reach the exact session that
-owns the topic; a topic with no matching pane (a non-tmux session) simply isn't
-woken and backoff's cap bounds its latency. Lives in `telegram-router.py`
-(`wake_session`, `_pane_for_claude_pid`).
+**Fallback heartbeat.** A non-tmux session, a dead pane, or a send-keys race means
+a push can be missed. So each session keeps ONE slow heartbeat cron
+(`heartbeat_seconds`, default 1800 = 30m) whose only job is to drain anything a
+missed push left behind. No backoff ladder, no `idle.count`/`poll.level`, no
+per-tick rescheduling — one fixed interval. Worst-case latency for a *missed* push
+is the heartbeat interval; a delivered push drains immediately. (Trade-off: a lossy
+send-keys-while-busy would make 30m the worst-case detection latency for a lost
+message — tune `heartbeat_seconds` down if that proves an issue in practice.)
 
-**Auto-compaction (process handoff).** A live process can't shrink its own context,
-so at the trigger threshold the session does a *handoff*: `/context-save` → spawn a
-fresh replacement in the SAME topic (attach mode) → the replacement `/context-restore`s,
-attaches, and takes over → the old session stops. A per-topic mkdir lock plus a
-`compacting.lock` / `handoff-ready` handshake guarantee the two pollers never overlap
-and no message is dropped or double-answered across the cutover. The handoff needs a
-save/restore mechanism to carry context across: the default install uses the gstack
-`/context-save` + `/context-restore` skills (controllable and near-lossless), but the
-save step writes a plain handoff file (`SESS/context-restore.md`) the replacement
-reads, so you can point it at your own mechanism — see "Customizing agent behavior" in
-the README. Claude Code's native auto-compact still sits underneath as a safety net.
+**Auto-compaction (router-driven handoff).** A live process can't shrink its own
+context, so the **router** detects the trigger: `context_loop` compares each
+session's `pct` against `trigger_pct` and, when crossed (and the session is not
+already compacting — guarded by `compacting.lock`), nudges it to `/compact`. The
+session then does the *handoff*: save context → spawn a fresh replacement in the
+SAME topic (attach mode) → the replacement restores, attaches, takes over → the old
+session stops. A per-topic mkdir lock plus a `compacting.lock` / `handoff-ready`
+handshake guarantee the two never overlap and no message is dropped or
+double-answered across the cutover. The save/restore mechanism is pluggable: the
+default install uses gstack `/context-save` + `/context-restore`, but the save step
+writes a plain handoff file (`SESS/context-restore.md`) the replacement reads, so
+you can point it at your own mechanism — see "Customizing agent behavior" in the
+README. Claude Code's native auto-compact still sits underneath as the ultimate
+safety net if the router's detection is ever down.
 
 **Tuning** (`~/.telegram-bridge/compaction.json`, read live — no restart):
 
@@ -329,6 +340,8 @@ the README. Claude Code's native auto-compact still sits underneath as a safety 
 |-------|---------|---------|
 | `trigger_pct` | `0.85` | Auto-compact at this fraction of the context window |
 | `warn_pct` | `0.75` | Show ⚠️ on the sticky at this fraction |
+| `heartbeat_seconds` | `1800` | The session's single fallback-drain cron interval |
+| `context_interval_seconds` | `90` | How often the router recomputes each gauge + checks the trigger |
 | `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` (find + clean up by hand); `true` kills it |
 
 Trigger it manually with `/compact` from the topic; check the gauge any time with
@@ -453,11 +466,20 @@ blocks, the session is busy so its poll cron doesn't contend.
 
 ## Known Limitations
 
-- **Idle-only**: messages are processed when the session is idle (CronCreate fires on
-  idle), so a message sent mid-task waits until the task finishes. This is intentional
-  — it won't interrupt running work.
-- **Session-scoped cron**: the poll dies when this Claude session exits. The daemon
-  keeps running (launchd), but reattaching is a fresh `/telegram`.
+- **Idle-only processing**: the router's drain nudge (and the heartbeat) are
+  consumed when the session is idle, so a message sent mid-task waits until the task
+  finishes. This is intentional — it won't interrupt running work.
+- **Push reliability is load-bearing**: delivery is the router's `send-keys` nudge;
+  the only backstop is the slow fallback heartbeat (default 30m). A missed nudge
+  (non-tmux session, dead pane, send-keys race) delays a message up to the heartbeat
+  interval. UNVERIFIED until the first live test: whether send-keys into a *busy*
+  Claude Code TUI reliably buffers the nudge.
+- **Session-scoped heartbeat cron**: the heartbeat dies when this Claude session
+  exits. The daemon keeps running (launchd), but reattaching is a fresh `/telegram`.
+- **In-flight sessions don't hot-cut**: a running session captured its prompt at
+  CronCreate time, so shipping a new template only affects sessions started after the
+  change. Existing sessions keep their old model until they roll over (`/end` or
+  compaction).
 - **Owner-locked**: only the bootstrapped owner (your Telegram user) is accepted; other
   senders are dropped by the daemon.
 - **Plain text replies**: v1 sends plain text, chunked at 4096 chars. Rich
