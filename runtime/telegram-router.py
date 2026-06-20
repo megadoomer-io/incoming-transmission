@@ -29,6 +29,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -49,11 +50,18 @@ STICKY_DIR = STATE_DIR / "sticky"
 INBOX_ROOT = Path("/tmp/claude-telegram/sessions")
 BRIDGE_DIR = Path.home() / ".telegram-bridge"
 SPAWN_SCRIPT = BRIDGE_DIR / "telegram-spawn.sh"
+# Context gauge: in the smart-router / dumb-session model the router computes each
+# attached session's context occupancy itself (the session no longer self-polls).
+# It shells out to the same telegram-context.py the sessions used to run, on its
+# own timer thread (OFF the getUpdates path so a big transcript scan can't stall
+# message routing).
+CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
 # Tunables for the status sticky + auto-compaction, read live each loop so the
 # user can edit thresholds without restarting the daemon. Defaults match the
 # shipped compaction.json.
 CONFIG_FILE = BRIDGE_DIR / "compaction.json"
-CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False}
+CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
+                   "context_interval_seconds": 90}
 
 LONG_POLL_SECONDS = 30
 # socket timeout must exceed the long-poll window so the connection isn't torn
@@ -534,32 +542,112 @@ def _pane_for_claude_pid(target_pid):
     return None
 
 
-def wake_session(reg):
-    """Best-effort: nudge the topic's pane to run a full poll tick NOW so a
-    backed-off cron doesn't sit on the just-delivered message. Never raises."""
+def _nudge_pane(reg, text, kind):
+    """Best-effort: send-keys a one-line instruction into the topic's pane (the
+    pid-matched session). One line (no embedded newline) so Enter submits exactly
+    once. Never raises. Returns True if a pane was found and nudged.
+
+    INVARIANT: a nudge is a drain/compact IMPERATIVE only — it never carries the
+    message payload. The payload always travels via the inbox; the nudge just
+    tells the session to go read it. Keeping payload out of the nudge means a
+    nudge can never be mistaken for task content."""
     try:
         cpid = reg.get("claude_pid")
         thread_id = reg.get("thread_id")
         if not cpid or thread_id is None:
-            return
+            return False
         pane = _pane_for_claude_pid(int(cpid))
         if not pane:
-            log("wake: no matching pane for topic {} (claude_pid {})".format(thread_id, cpid))
-            return
-        # One line (no embedded newline so Enter submits exactly once). Delegates
-        # to the session's existing, tested A/B/C/D poll procedure: that drains
-        # the message, runs the compaction-safety check (so a wake-driven burst
-        # can't blow past the trigger while the cron sleeps), and resets backoff.
-        nudge = ("TELEGRAM WAKE {tid}: a message arrived and your poll cron may be backed off. "
-                 "Run ONE full bridge poll tick NOW (the A/B/C/D procedure from your poll cron "
-                 "prompt: status gauge, auto-compaction check, drain inbox + reply, backoff "
-                 "reschedule). It drains the new message immediately and resets backoff to fast."
-                 ).format(tid=thread_id)
-        _tmux("send-keys", "-t", pane, "-l", nudge)
+            log("{}: no matching pane for topic {} (claude_pid {})".format(kind, thread_id, cpid))
+            return False
+        _tmux("send-keys", "-t", pane, "-l", text)
         _tmux("send-keys", "-t", pane, "Enter")
-        log("wake: nudged topic {} (pane {})".format(thread_id, pane))
+        log("{}: nudged topic {} (pane {})".format(kind, thread_id, pane))
+        return True
     except Exception as e:
-        log("wake: error (ignored): {}".format(e))
+        log("{}: error (ignored): {}".format(kind, e))
+        return False
+
+
+def wake_session(reg):
+    """Push delivery (PRIMARY path): nudge the topic's pane to DRAIN its inbox now.
+
+    In the smart-router / dumb-session model the session has no fast poll cron,
+    only a slow fallback heartbeat — so a message waits on this nudge (or, if the
+    nudge is missed, the heartbeat) to be drained. The session's heartbeat prompt
+    defines section A (the drain procedure) that this nudge refers to."""
+    thread_id = reg.get("thread_id")
+    nudge = ("TELEGRAM WAKE {tid}: a message arrived. Run section A (DRAIN INBOX) of "
+             "your heartbeat poll prompt NOW: take the SESS/poll.lock.d lock, read new "
+             "lines after SESS/read.offset, reply to each, advance read.offset, release "
+             "the lock. The router owns timing and your context gauge.").format(tid=thread_id)
+    _nudge_pane(reg, nudge, "wake")
+
+
+def nudge_compact(reg):
+    """Router-driven compaction: when the context thread sees a session cross
+    trigger_pct (and it is not already compacting), nudge it to run its COMPACTION
+    HANDOFF. Only the live process can /context-save + spawn its replacement, so
+    the router can only ask; the session no longer self-checks pct."""
+    thread_id = reg.get("thread_id")
+    nudge = ("TELEGRAM WAKE {tid}: /compact — your context gauge crossed the trigger. "
+             "Run the COMPACTION HANDOFF from your heartbeat poll prompt now (save context, "
+             "spawn a fresh replacement in this same topic, hand off).").format(tid=thread_id)
+    _nudge_pane(reg, nudge, "compact")
+
+
+def compute_status(reg, tkey):
+    """Run telegram-context.py for one topic so it (re)writes SESS/status.json.
+    The session no longer does this — the router owns the gauge. Best-effort with
+    a timeout so a huge transcript scan can't wedge the context thread; runs under
+    the router's own interpreter (context.py is pure stdlib python3)."""
+    tp = reg.get("transcript_path")
+    if not tp or not CONTEXT_SCRIPT.exists():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(CONTEXT_SCRIPT), "--transcript", tp, "--thread", tkey],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        log("context: compute failed for topic {}: {}".format(tkey, e))
+
+
+def context_loop():
+    """Daemon thread: refresh every attached topic's context gauge on a fixed
+    interval, OFF the getUpdates path (a big transcript scan must never stall the
+    router's message pump). After each refresh, if a session has crossed
+    trigger_pct and is not already compacting, nudge it to run its handoff.
+
+    update_stickies() (on the main loop) still just READS the status.json this
+    thread writes and edits the pin — fast, no scan."""
+    while _running:
+        cfg = load_compaction_cfg()
+        interval = max(15, int(cfg.get("context_interval_seconds", 90) or 90))
+        trigger = cfg.get("trigger_pct", 0.85)
+        if REGISTRY_DIR.is_dir():
+            for f in REGISTRY_DIR.glob("*.json"):
+                tkey = f.stem
+                try:
+                    reg = json.loads(f.read_text())
+                except (ValueError, OSError):
+                    continue
+                if reg.get("thread_id") is None:
+                    continue
+                compute_status(reg, tkey)
+                # Router-driven compaction trigger detection. Guard on
+                # compacting.lock so we nudge once, not every interval while the
+                # session is mid-handoff (the session creates the lock when it
+                # starts the handoff and removes it at the cutover).
+                status = read_status(tkey)
+                pct = (status or {}).get("pct")
+                lock = INBOX_ROOT / tkey / "compacting.lock"
+                if pct is not None and pct >= trigger and not lock.exists():
+                    nudge_compact(reg)
+        # Sleep in 1s slices so SIGTERM/shutdown is responsive.
+        slept = 0
+        while _running and slept < interval:
+            time.sleep(1)
+            slept += 1
 
 
 def handle_message(msg, state):
@@ -820,6 +908,11 @@ def main():
 
     # Refresh the tappable "/" command menu on every startup (idempotent).
     register_commands(state.get("chat_id"))
+
+    # Smart-router context thread: computes each attached session's context gauge
+    # and drives compaction, OFF the getUpdates path. daemon=True so it dies with
+    # the process; the main loop owns shutdown via _running.
+    threading.Thread(target=context_loop, name="context", daemon=True).start()
 
     net_failures = 0
     while _running:
