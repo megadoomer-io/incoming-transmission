@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "__UV__",
+      "args": [
+        "run",
+        "--quiet",
+        "__HOME__/.telegram-bridge/telegram-auq-mcp.py"
+      ]
+    }
+  }
+}

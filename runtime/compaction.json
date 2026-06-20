@@ -1,0 +1,9 @@
+{
+  "trigger_pct": 0.85,
+  "warn_pct": 0.75,
+  "kill_old": false,
+  "polling": {
+    "idle_intervals_seconds": [60, 120, 300, 1800],
+    "ticks_per_rung": 3
+  }
+}

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Control script for the telegram-bridge router daemon (launchd).
+# Mirrors dotfiles-sync. Code is stowed to ~/.telegram-bridge; runtime state
+# (chat_id, offset, registry, logs) lives in ~/.local/state/telegram-bridge and
+# is never committed.
+set -euo pipefail
+
+PLIST_NAME="com.telegram.bridge"
+PLIST_SOURCE="$HOME/.telegram-bridge/$PLIST_NAME.plist"
+PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
+STATE_DIR="$HOME/.local/state/telegram-bridge"
+STATE_FILE="$STATE_DIR/state.json"
+LOG_FILE="$STATE_DIR/router.log"
+
+# Username the bridge locks to (only this Telegram user can claim it). Override
+# with TELEGRAM_BRIDGE_ALLOWED_USERNAME before `start`. Used only to seed a fresh
+# state.json — the numeric user id is captured on first contact.
+ALLOWED_USERNAME="${TELEGRAM_BRIDGE_ALLOWED_USERNAME:-}"
+
+seed_state() {
+    mkdir -p "$STATE_DIR"
+    if [ ! -f "$STATE_FILE" ]; then
+        printf '{\n  "offset": 0,\n  "chat_id": null,\n  "allowed_user_id": null,\n  "allowed_username": %s\n}\n' \
+            "$([ -n "$ALLOWED_USERNAME" ] && printf '"%s"' "$ALLOWED_USERNAME" || printf 'null')" \
+            > "$STATE_FILE"
+        echo "Seeded $STATE_FILE (allowed_username=${ALLOWED_USERNAME:-null})"
+    fi
+}
+
+cmd_start() {
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "telegram-bridge is already running"
+        return 0
+    fi
+
+    if [ ! -f "$PLIST_SOURCE" ]; then
+        echo "Error: plist template not found at $PLIST_SOURCE" >&2
+        echo "Run ./install.sh from the incoming-transmission repo first." >&2
+        return 1
+    fi
+
+    local token="${TELEGRAM_BRIDGE_BOT_TOKEN:-}"
+    if [ -z "$token" ]; then
+        echo "Error: TELEGRAM_BRIDGE_BOT_TOKEN not set." >&2
+        echo "Set TELEGRAM_BRIDGE_BOT_TOKEN in your shell profile or secrets manager." >&2
+        return 1
+    fi
+
+    seed_state
+    mkdir -p "$STATE_DIR"
+
+    sed -e "s|__HOME__|$HOME|g" \
+        -e "s|__STATE_DIR__|$STATE_DIR|g" \
+        -e "s|__TOKEN__|$token|g" \
+        "$PLIST_SOURCE" > "$PLIST_DEST"
+
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
+    echo "telegram-bridge started"
+}
+
+cmd_stop() {
+    if ! launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "telegram-bridge is not running"
+        return 0
+    fi
+    launchctl bootout "gui/$(id -u)/$PLIST_NAME"
+    rm -f "$PLIST_DEST"
+    echo "telegram-bridge stopped"
+}
+
+cmd_restart() {
+    cmd_stop || true
+    # `launchctl bootout` is asynchronous: the service can linger in the list for
+    # a moment after stop returns. Poll until it is fully gone, otherwise
+    # cmd_start sees "already running" and silently bails, leaving the daemon down.
+    for _ in $(seq 1 20); do
+        launchctl list "$PLIST_NAME" &>/dev/null || break
+        sleep 0.5
+    done
+    cmd_start
+}
+
+cmd_status() {
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        local pid
+        pid="$(launchctl list "$PLIST_NAME" | awk '/"PID"/ {gsub(/[^0-9]/,"",$NF); print $NF}')"
+        echo "Status: running (PID: ${pid:--})"
+    else
+        echo "Status: stopped"
+    fi
+
+    if [ -f "$STATE_FILE" ]; then
+        echo "State: $STATE_FILE"
+        /usr/bin/python3 - "$STATE_FILE" <<'PY' 2>/dev/null || cat "$STATE_FILE"
+import json, sys
+s = json.load(open(sys.argv[1]))
+print("  owner:   @{} (id {})".format(s.get("allowed_username"), s.get("allowed_user_id")))
+print("  chat_id: {}".format(s.get("chat_id")))
+print("  offset:  {}".format(s.get("offset")))
+PY
+    else
+        echo "State: (not yet created — start the daemon and send the bot a message)"
+    fi
+
+    local reg_dir="$STATE_DIR/registry"
+    if [ -d "$reg_dir" ]; then
+        local n
+        n="$(find "$reg_dir" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+        echo "Attached topics: $n"
+    fi
+}
+
+cmd_log() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "No log file found at $LOG_FILE"
+        return 1
+    fi
+    tail -f "$LOG_FILE"
+}
+
+cmd_help() {
+    cat <<'EOF'
+Usage: telegram-bridge <command>
+
+Commands:
+  start    Start the router daemon (launchd)
+  stop     Stop the router daemon
+  restart  Stop then start
+  status   Show daemon status, owner, chat id, attached topics
+  log      Tail the router log
+  help     Show this help message
+
+First run: set TELEGRAM_BRIDGE_ALLOWED_USERNAME to lock the bridge to your
+Telegram username, then `telegram-bridge start` and send the bot any message
+to bootstrap (captures your user id + chat id).
+EOF
+}
+
+case "${1:-help}" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_restart ;;
+    status)  cmd_status ;;
+    log)     cmd_log ;;
+    help)    cmd_help ;;
+    *)
+        echo "Unknown command: $1" >&2
+        cmd_help >&2
+        exit 1
+        ;;
+esac
