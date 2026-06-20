@@ -16,6 +16,14 @@ extraction of a personal tool, published under the **megadoomer** brand (itself 
 Zim reference — the Megadoomer is the giant mech the Tallest hand Zim). Zero
 runtime dependencies: pure Python stdlib + the Telegram Bot API.
 
+> ## ⚠️ Status: pre-release, UNTESTED
+>
+> This is a fresh extraction. The runtime is the proven code from a working
+> private setup, but the **packaged repo has not been installed or run
+> end-to-end yet**. Treat it as a preview — read it, clone it, but expect rough
+> edges if you run it before the first tested release (v0.1). **Install at your
+> own risk until then.** Known caveats are listed in [Caveats](#caveats) below.
+
 ## The vocabulary
 
 The metaphor maps onto the architecture, so the docs and logs use it:
@@ -190,6 +198,25 @@ telegram-bridge start|stop|restart|status|log
 - Spawned sessions run with elevated autonomy by design (unattended). Only enable
   `/new` if you understand that a phone message can drive a session that can edit
   files and run tools. The Tier-2 hook routes the riskier approvals back to you.
+
+## Caveats
+
+- **Untested end-to-end.** See the status banner up top. The runtime is proven;
+  the packaged install path is not yet validated.
+- **macOS only (for now).** The daemon + watchdog are launchd services and the
+  installer renders launchd plists. The Python runtime is portable; a Linux
+  (systemd) service layer is a TODO.
+- **Claude Code specific.** The in-session poll loop is a session-scoped cron, a
+  Claude Code feature. This is not a generic LLM/agent bridge.
+- **gstack coupling.** Context save/restore and the compaction handoff call
+  gstack skills by default. Without them, follow
+  [Decoupling from gstack](#decoupling-from-gstack).
+- **Telegram setup gotchas.** The group MUST have **topics/forum mode enabled**,
+  and the bot MUST be a group **admin** to create topics and read messages.
+- **Elevated autonomy.** Spawned sessions (`/new`) run unattended with broad tool
+  access. A phone message can drive a session that edits files and runs commands.
+  Only enable `/new` if you accept that. See [Security notes](#security-notes).
+- **Single owner.** Bootstraps to one Telegram user; not multi-user.
 
 ## License
 
