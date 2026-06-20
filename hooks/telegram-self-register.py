@@ -1,8 +1,4 @@
-#!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.13"
-# dependencies = []
-# ///
+#!/usr/bin/env python3
 """SessionStart hook: register this session's transcript for the Telegram bridge.
 
 The bridge's context-% / auto-compaction feature needs a live session to find its

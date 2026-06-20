@@ -6,7 +6,7 @@
 # this stuff is worth it, you can buy me a beer in return.
 # ----------------------------------------------------------------------------
 #
-# telegram-router: the sole reader of the @mcd_claude_bot update stream.
+# telegram-router: the sole reader of the bridge bot's update stream.
 #
 # Telegram's getUpdates is single-consumer (offset-based), so exactly ONE
 # process may poll a bot. This daemon is that process. It long-polls getUpdates,
@@ -124,7 +124,7 @@ def thread_key(message_thread_id):
 
 def normalize_command(text):
     """Strip the @botname suffix Telegram appends to slash-commands sent from the
-    in-app command menu in a group (e.g. '/end@mcd_claude_bot' -> '/end').
+    in-app command menu in a group (e.g. '/end@your_bot' -> '/end').
 
     Only the FIRST token is touched, and only when it starts with '/', so a real
     command never reaches a session (or the daemon dispatcher) carrying the bot
@@ -440,11 +440,11 @@ def download_file(file_id, dest_dir, basename):
 
 WELCOME = (
     "✅ Telegram bridge is live.\n\n"
-    "I'm @mcd_claude_bot, wired into Mike's Claude Code. This chat is now the "
-    "control group, locked to @{username}.\n\n"
-    "How it works: in an active Claude session, Mike runs /telegram and I open a "
-    "topic here for that session. Whatever he types in a topic goes straight to "
-    "that live session, which replies here with full context, tools, and memory.\n\n"
+    "I'm this Claude Code bridge bot. This chat is now the control group, locked "
+    "to @{username}.\n\n"
+    "How it works: in an active Claude session, run /telegram and I open a topic "
+    "here for that session. Whatever you type in a topic goes straight to that "
+    "live session, which replies here with full context, tools, and memory.\n\n"
     "Commands: /whoami, /sessions, /help\n\n"
     "Reply to this message to confirm the round-trip works. \U0001F355"
 )
