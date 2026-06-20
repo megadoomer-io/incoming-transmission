@@ -1,0 +1,31 @@
+# spawn-preamble — operator style for UNATTENDED /new spawns (OPTIONAL)
+#
+# incoming-transmission is an agnostic transport: by default it tells a spawned
+# session ONLY the transport-necessary facts and lets it behave like normal
+# Claude. This file is the seam for layering your OWN operator style on top.
+#
+# If a non-comment, non-empty version of this file exists at
+# ~/.telegram-bridge/spawn-preamble.txt, telegram-spawn.sh prepends its contents
+# to the spawn prompt for `/new` sessions. With no such file (the default),
+# nothing is injected and the spawn behaves like vanilla Claude plus the
+# transport mechanics.
+#
+# This applies ONLY to `/new` spawns, which run UNATTENDED (no human at the TUI).
+# That is the one place an autonomy posture is defensible — there is nobody to
+# answer a blocking question. A bridged (human-in-the-loop) session uses
+# bridge-preamble.example.txt instead.
+#
+# Lines beginning with '#' and blank lines are ignored. To activate, copy this to
+# ~/.telegram-bridge/spawn-preamble.txt and write your guidance below (without the
+# '#').
+#
+# Example operator style you MIGHT choose (delete the '#' to use, or write your own):
+#
+# Make decisions yourself and state your assumptions rather than asking. Be
+# deliberate with writes. Prefer reversible actions. When you finish a unit of
+# work, summarize what you did and what is left.
+#
+# Example: restore prior context with your own save/restore skill on startup:
+#
+# Before doing anything else, run /context-restore to load any saved checkpoint
+# for this project.

@@ -27,6 +27,21 @@ TMPL="$BRIDGE_DIR/poll-prompt.tmpl"
 
 thread="$1"; chat="$2"; inbox="$3"; cwd="$4"
 
+# Optional operator-style preamble for BRIDGED (human-in-the-loop) sessions.
+# incoming-transmission is an agnostic transport: the poll prompt below describes
+# ONLY transport mechanics. A user who wants to layer their own style onto a
+# bridged session drops it in ~/.telegram-bridge/bridge-preamble.txt (seeded empty
+# from bridge-preamble.example.txt by the installer). We strip comment/blank lines
+# and emit it ahead of the rendered prompt only when it has real content. See
+# README "Customizing agent behavior".
+PREAMBLE_FILE="${TELEGRAM_BRIDGE_PREAMBLE:-$HOME/.telegram-bridge/bridge-preamble.txt}"
+if [ -f "$PREAMBLE_FILE" ]; then
+    preamble="$(grep -vE '^[[:space:]]*(#|$)' "$PREAMBLE_FILE" 2>/dev/null || true)"
+    if [ -n "$preamble" ]; then
+        printf '%s\n\n' "$preamble"
+    fi
+fi
+
 # `|` is safe as the sed delimiter: thread/chat are numeric, inbox/cwd are paths
 # (no pipes). Values are positional args, never interpolated into the pattern.
 sed -e "s|{{THREAD_ID}}|${thread}|g" \

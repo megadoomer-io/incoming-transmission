@@ -99,16 +99,49 @@ win="$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 # environment, so the mode can't be inherited by accident. The /telegram skill in
 # the child still keys off TELEGRAM_BRIDGE_ATTACH_THREAD, which we inject into the
 # child env below from these flag values.
+# Optional operator-style preamble. incoming-transmission is an agnostic
+# transport: by default it injects ONLY transport-necessary facts and lets the
+# spawned session behave like normal Claude. A user who wants to layer their own
+# autonomy/style guidance onto UNATTENDED spawns drops it in
+# ~/.telegram-bridge/spawn-preamble.txt (seeded empty from spawn-preamble.example.txt
+# by the installer). We read it, strip comment/blank lines, and prepend it to the
+# prompt only when it has real content. See README "Customizing agent behavior".
+PREAMBLE_FILE="${TELEGRAM_BRIDGE_SPAWN_PREAMBLE:-$HOME/.telegram-bridge/spawn-preamble.txt}"
+preamble=""
+if [ -f "$PREAMBLE_FILE" ]; then
+    preamble="$(grep -vE '^[[:space:]]*(#|$)' "$PREAMBLE_FILE" 2>/dev/null || true)"
+fi
+
+# TRANSPORT-NECESSARY mechanism note (NOT an opinion on how to behave): a `/new`
+# spawn has no human at the TUI, so a blocking native AskUserQuestion would hang
+# the detached pane forever. Native AUQ is therefore disabled for spawns (via
+# --disallowedTools below); the optional Telegram AUQ MCP is the supported way to
+# ask the owner a question from an unattended spawn. This is the floor of what the
+# session must know to function over the transport; any style guidance is layered
+# in via the preamble above.
+spawn_mechanism="Transport note: you were spawned UNATTENDED (no human at this terminal). Native AskUserQuestion is disabled here because a blocking prompt would hang the detached pane; if the Telegram AskUserQuestion MCP is configured, use it to reach the owner, otherwise proceed without it."
+
 if [ -n "$ATTACH_THREAD" ]; then
     prompt="You are a compaction replacement for a Telegram-bridged session whose context filled up. Do these IN ORDER, then wait for instructions:
-1. Restore the prior working context: invoke /context-restore ${RESTORE_FILE}
+1. Restore the prior working context from the handoff file: ${RESTORE_FILE}
 2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then start the poll cron.
-3. Continue the restored work.\n\nYou are running UNATTENDED (nobody is at the keyboard). Do NOT call AskUserQuestion -- it is disabled and will be denied. Make decisions yourself and state your assumptions. Gated tools (Write/Edit/MCP) auto-run without approval in this mode, so be deliberate with writes."
+3. Continue the restored work.
+
+${spawn_mechanism}"
 else
     prompt="You were spawned by the telegram bridge. Do these IN ORDER, then wait for instructions:
-1. Invoke /context-restore to load any prior saved context for this project. If it reports no saved context, that is fine -- carry on. The latest checkpoint may be old; it labels the age so you can judge relevance.
-2. Invoke the /telegram skill to attach yourself to a Telegram topic.
-3. Wait for instructions.\n\nYou are running UNATTENDED (nobody is at the keyboard). Do NOT call AskUserQuestion -- it is disabled and will be denied. Make decisions yourself and state your assumptions. Gated tools (Write/Edit/MCP) auto-run without approval in this mode, so be deliberate with writes."
+1. Invoke the /telegram skill to attach yourself to a Telegram topic.
+2. Wait for instructions.
+
+${spawn_mechanism}"
+fi
+
+# Prepend the operator preamble (if any) so user style sits ahead of the
+# transport mechanics. Default install ships an empty preamble -> no change.
+if [ -n "$preamble" ]; then
+    prompt="${preamble}
+
+${prompt}"
 fi
 
 # Pre-trust the target dir so the spawned claude doesn't hang on the "Do you
@@ -118,10 +151,11 @@ fi
 # unattended tool calls never block on the native permission prompt. A hook
 # returning permissionDecision="allow" does NOT suppress that prompt in Claude
 # Code 2.1.170 (only "deny" is honored), so the engine-level flag is the only
-# reliable way to keep an unattended session flowing. AskUserQuestion is removed
-# from spawn (no AUQ MCP + native disallowed) so the model decides autonomously
-# instead of wedging on a question. Best-effort: a failure here just means the
-# dialog may appear (it won't break the spawn). Atomic via tmp+rename.
+# reliable way to keep an unattended session flowing. Native AskUserQuestion is
+# disabled for spawns (--disallowedTools below) because a blocking prompt has no
+# one to answer it in a detached pane; the optional Telegram AUQ MCP is the
+# supported channel for asking the owner instead. Best-effort: a failure here
+# just means the dialog may appear (it won't break the spawn). Atomic via tmp+rename.
 /usr/bin/python3 - "$dir" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile, pathlib
 cfg = pathlib.Path.home() / ".claude.json"
