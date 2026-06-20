@@ -61,31 +61,40 @@ The metaphor maps onto the architecture, so the docs and logs use it:
 
 ## How it fits together
 
+Smart router, dumb session: the Massive owns all timing (routing, push delivery,
+the context gauge, and compaction triggering); a session just drains its inbox when
+nudged.
+
 ```
 Phone topic ──> the Massive (router daemon, sole getUpdates reader) ──> session inbox
-                                                                            │
-                          in-session poll loop (fires on idle) reads inbox ─┘
-                                  │ processes in-session, replies
-Phone topic <── telegram-send.sh ─┘
+                     │  send-keys "drain now" nudge ───────────────┐
+                     │  context thread: gauge + compaction trigger   │
+                     ▼                                              ▼
+              status.json / pinned sticky          session drains inbox, replies
+Phone topic <───────────────────────── telegram-send.sh ◀──────────┘
 ```
 
 - **The Massive** (`telegram-router.py`, launchd) is the ONLY process that reads
   Telegram (getUpdates is single-consumer). It routes each message by
-  `message_thread_id` to that session's `inbox.jsonl`.
-- **`/telegram`** (a Claude Code skill — see `skill/`) creates the topic,
-  registers ownership, and starts an in-session poll (a session-scoped cron) that
-  drains the inbox and replies. The poll fires on idle, so a message never
-  interrupts running work.
+  `message_thread_id` to that session's `inbox.jsonl`, then **pushes** the session a
+  one-line drain nudge. A separate thread computes each session's context gauge and
+  triggers compaction — off the getUpdates path.
+- **`/telegram`** (a Claude Code skill — see `skill/`) creates the topic, registers
+  ownership, does an initial drain, and starts ONE slow **fallback heartbeat** cron
+  (for a missed push). Processing is in-session, so a message never interrupts
+  running work.
 - **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
   safety net for a session wedged on an interactive prompt nobody can answer.
 
 ## Features
 
 - **One reader, many sessions** — single-consumer routing by topic; no polling collisions.
-- **Adaptive backoff** — polls every 60s while a conversation is active, ramps to
-  a slow cap when idle so an idle session doesn't burn context. A router-side
-  *wake* nudge pulls a new message immediately, so backoff never sits on a message.
-- **Context gauge** — a pinned per-topic sticky shows `cwd · N msgs · ~XX% ctx`.
+- **Push delivery** — the router `send-keys` a drain nudge to the session's pane
+  (matched by pid identity) the moment a message arrives. No fast poll cron; a single
+  slow heartbeat (default 30m) backstops a missed push. The nudge is a drain
+  imperative only — payload always travels via the inbox.
+- **Context gauge** — the router computes each session's occupancy on its own thread
+  and shows it on a pinned per-topic sticky: `cwd · N msgs · ~XX% ctx`.
 - **Auto-compaction (PAK transfer)** — at a context threshold the session saves
   state, spawns a fresh replacement in the same topic, and hands off, with a lock
   + handshake so no message is dropped or double-answered. *(Requires a
@@ -252,7 +261,7 @@ known and pending the first end-to-end test:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, polling ladder |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `heartbeat_seconds`, `context_interval_seconds` |
 | `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
 | `spawn-preamble.txt` | optional operator style for `/new` spawns (empty by default; gitignored) |
 | `bridge-preamble.txt` | optional operator style for bridged sessions (empty by default; gitignored) |
