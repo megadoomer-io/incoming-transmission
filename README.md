@@ -13,8 +13,13 @@ messages), not a throwaway subagent. The session keeps all its working memory.
 
 This is an [Invader Zim](https://en.wikipedia.org/wiki/Invader_Zim)-themed
 extraction of a personal tool, published under the **megadoomer** brand (itself a
-Zim reference — the Megadoomer is the giant mech the Tallest hand Zim). Zero
-runtime dependencies: pure Python stdlib + the Telegram Bot API.
+Zim reference — the Megadoomer is the giant mech the Tallest hand Zim). The core
+runtime is pure Python stdlib + the Telegram Bot API — no third-party packages.
+The one exception is the **optional** AskUserQuestion MCP server
+(`telegram-auq-mcp.py`), which needs the `mcp` package and runs via
+[`uv`](https://docs.astral.sh/uv/); you only need it if you spawn unattended
+sessions with `/new` and want them to ask you questions on the phone. Everything
+else — router, hooks, poll loop, watchdog — is stdlib-only.
 
 > ## ⚠️ Status: pre-release, UNTESTED
 >
@@ -23,6 +28,23 @@ runtime dependencies: pure Python stdlib + the Telegram Bot API.
 > end-to-end yet**. Treat it as a preview — read it, clone it, but expect rough
 > edges if you run it before the first tested release (v0.1). **Install at your
 > own risk until then.** Known caveats are listed in [Caveats](#caveats) below.
+
+## Philosophy: transport, not workflow opinion
+
+`incoming-transmission` is an **agnostic transport**. Its job is to move messages
+between your phone and a live Claude Code session — nothing more. It deliberately
+does **not** bake in any opinion about how an agent should behave, decide, or work.
+
+By default, a bridged session behaves like normal collaborative Claude (you're in
+the topic, so there's a human to talk to), and a `/new` spawn behaves like normal
+Claude plus the bare minimum of transport mechanics. The only behavioral text the
+bridge injects on its own is **transport-necessary mechanism** — e.g. telling an
+unattended spawn that native `AskUserQuestion` is disabled (a blocking prompt has
+no one to answer it in a detached pane), so it uses the Telegram AUQ path instead.
+
+Anything beyond that — autonomy posture, "make decisions yourself", journal/save on
+`/end`, restore-on-startup — is **yours to add**, via a documented seam, and is off
+by default. See [Customizing agent behavior](#customizing-agent-behavior).
 
 ## The vocabulary
 
@@ -67,11 +89,15 @@ Phone topic <── telegram-send.sh ─┘
 - **Auto-compaction (PAK transfer)** — at a context threshold the session saves
   state, spawns a fresh replacement in the same topic, and hands off, with a lock
   + handshake so no message is dropped or double-answered. *(Requires a
-  save/restore skill — see "Decoupling from gstack" below.)*
+  save/restore mechanism — see [Customizing agent behavior](#customizing-agent-behavior).)*
 - **Spawn from your phone** — `/new <dir>` launches a fresh attached session as a
   tmux tab.
-- **Unattended permissions (Tier 2)** — spawned sessions route Write/Edit/MCP
-  approvals to the topic as tap-to-approve buttons.
+- **Unattended permissions (Tier 2)** — optional tap-to-approve: with
+  `spawned_mode: "ask"`, spawned sessions route Write/Edit/MCP approvals to the
+  topic as buttons. **The shipped default is `auto-allow` (fully autonomous, no
+  approval round-trip)** — see the warning under
+  [Spawning new sessions](#spawning-new-sessions--new) and
+  [Known issues](#known-issues).
 - **Images** — attach a photo in the topic; the session reads it.
 
 ## Requirements
@@ -144,28 +170,82 @@ Typed in the control group (handled by the Massive):
 | `/whoami` | chat_id, your user_id, current topic |
 | `/sessions` | list attached sessions |
 
-## Decoupling from gstack
+> **⚠️ `/new` spawns are autonomous by default.** A spawned session ships with
+> `spawned_mode: "auto-allow"`: it runs Write/Edit/MCP tools and answers its own
+> questions with **no tap-to-approve round-trip**. A phone message can drive a
+> session that edits files and runs commands unattended. Set `spawned_mode: "ask"`
+> in `~/.telegram-bridge/permissions.json` for tap-to-approve. See
+> [Known issues](#known-issues) — whether `auto-allow` should be the default is a
+> pending decision.
 
-This tool was extracted from a setup that uses
-[gstack](https://garryslist.org) skills for context save/restore. Three touchpoints
-reference them; a vanilla install must adjust them. They are all in
-`runtime/poll-prompt.tmpl` and `runtime/telegram-spawn.sh`:
+## Customizing agent behavior
 
-1. **`/end`** (`poll-prompt.tmpl`) calls `/track` then `/context-save` before
-   detaching. Without those skills, drop those two calls — `/end` just closes the
-   topic.
-2. **Auto-compaction handoff** (`poll-prompt.tmpl`, COMPACTION HANDOFF block) calls
-   `/context-save` to seed the replacement and the replacement runs
-   `/context-restore`. Without a save/restore skill, either:
-   - disable the process handoff and rely on Claude Code's **native auto-compact**
-     (set `trigger_pct` high in `compaction.json` and treat the section as
-     warn-only), or
-   - point those two calls at your own save/restore commands.
-3. **Spawn prompt** (`telegram-spawn.sh`) tells new sessions to run
-   `/context-restore` first. Harmless if the skill is absent (it just no-ops), but
-   you can remove the line.
+The bridge ships agnostic: by default it injects only transport mechanics and lets
+the session behave like normal Claude (see
+[Philosophy](#philosophy-transport-not-workflow-opinion)). When you want to layer
+in your own operator style — autonomy posture, journaling, context save/restore,
+anything — there are a few clearly-marked seams. None of them are on by default.
+
+### The preamble seam (recommended)
+
+Two empty-by-default files are the supported place for your own behavioral text.
+The installer seeds them from `*.example.txt`; editing them never touches the
+shipped code, and they're gitignored so they stay yours.
+
+| File (`~/.telegram-bridge/`) | Injected into | When |
+|------------------------------|---------------|------|
+| `spawn-preamble.txt` | the `/new` spawn prompt (`telegram-spawn.sh`) | unattended spawns |
+| `bridge-preamble.txt` | the bridged session's poll prompt (`poll-render.sh`) | human-in-the-loop sessions |
+
+Each ships as comments only (so the default is empty → no behavior change). Add
+plain instructions; lines starting with `#` and blank lines are ignored. Your text
+is prepended **ahead of** the transport mechanics, so it frames the session. The
+`.example.txt` files contain worked examples (autonomy posture for spawns,
+journal-on-`/end` for bridged sessions).
+
+### Context save/restore (the gstack touchpoints)
+
+This tool was extracted from a setup that uses [gstack](https://garryslist.org)
+skills for context save/restore. Three places reference them. They are no longer
+hardcoded into behavior, but the **auto-compaction handoff genuinely needs a
+save/restore mechanism** to carry context across the cutover, so its default still
+points at gstack. Adjust via the seams above or by editing the runtime:
+
+1. **Restore on startup** — there's no longer a baked-in `/context-restore`. To get
+   it back, add `Before anything else, run /context-restore` to `spawn-preamble.txt`
+   (and/or `bridge-preamble.txt`).
+2. **Preserve on `/end`** — `/end` is now transport-teardown only. To journal +
+   checkpoint first, add e.g. `On /end, run /track then /context-save before
+   detaching` to `bridge-preamble.txt`.
+3. **Auto-compaction handoff** (`poll-prompt.tmpl`, COMPACTION HANDOFF block) writes
+   a handoff file `SESS/context-restore.md` that the replacement restores from. The
+   default produces it with the gstack `/context-save` skill. Without that skill,
+   either point the save step at your own command (write its output to
+   `SESS/context-restore.md`), or disable the process handoff and rely on Claude
+   Code's **native auto-compact** (set `trigger_pct` high in `compaction.json` and
+   treat the section as warn-only).
 
 Making save/restore fully config-driven (a `context_skill` knob) is on the roadmap.
+
+## Known issues
+
+Pre-release, untested. Beyond the [Caveats](#caveats), these specific items are
+known and pending the first end-to-end test:
+
+- **Spawned-session default is fully autonomous.** `permissions.json` ships
+  `spawned_mode: "auto-allow"`: a `/new` session runs Write/Edit/MCP and answers its
+  own questions with no approval round-trip. Tap-to-approve requires
+  `spawned_mode: "ask"`. Whether `auto-allow` should be the default is an open
+  decision — it ships this way because the approval round-trip is not yet validated.
+- **AskUserQuestion has one supported path and two unverified ones.** The intended,
+  supported channel for an unattended spawn to ask you a question is the
+  **AskUserQuestion MCP server** (`telegram-auq-mcp.py`), where a button **tap** is
+  delivered to the session via `auq-answer.json`. Two alternates are present but
+  unverified pending a runtime test: (a) a **typed** (non-button) answer to an MCP
+  question lands in the inbox, not `auq-answer.json`, so the MCP server doesn't see
+  it — use the buttons; (b) `telegram-askuserquestion-hook.py` is a PreToolUse-hook
+  variant that keys on a `via=="callback-auq"` marker the router doesn't currently
+  emit. Prefer the MCP server + button taps until the alternates are tested.
 
 ## Configuration
 
@@ -173,7 +253,9 @@ Making save/restore fully config-driven (a `context_skill` knob) is on the roadm
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
 | `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, polling ladder |
-| `permissions.json` | spawned-session permission mode |
+| `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
+| `spawn-preamble.txt` | optional operator style for `/new` spawns (empty by default; gitignored) |
+| `bridge-preamble.txt` | optional operator style for bridged sessions (empty by default; gitignored) |
 
 Identity (owner username, user id, chat id) is **not** in any file — it's captured
 into `~/.local/state/telegram-bridge/state.json` on first contact with the bot.
@@ -189,15 +271,28 @@ into `~/.local/state/telegram-bridge/state.json` on first contact with the bot.
 
 ```bash
 telegram-bridge start|stop|restart|status|log
+telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
 ```
 
 ## Security notes
 
-- **Owner-locked**: only the bootstrapped Telegram user is accepted; others are dropped.
+- **Owner-locked**: only the bootstrapped Telegram user is accepted; others are
+  dropped. The daemon **refuses to start** unless an owner is configured — either
+  `TELEGRAM_BRIDGE_ALLOWED_USERNAME` is set, or `state.json` already has an owner.
+  This narrows the bootstrap-hijack window (where the first person to message the
+  bot becomes the owner) to "you set your handle, then you message the bot".
 - The bot token is read from the environment, never placed on a command line.
-- Spawned sessions run with elevated autonomy by design (unattended). Only enable
-  `/new` if you understand that a phone message can drive a session that can edit
-  files and run tools. The Tier-2 hook routes the riskier approvals back to you.
+- **Token in the plist**: `telegram-bridge start` / `watchdog-start` render the bot
+  token into the launchd plists under `~/Library/LaunchAgents/`. Those files are
+  `chmod 600` (owner-only) right after rendering so the token isn't group/world
+  readable. A stronger option — keeping the token out of the plist entirely (e.g.
+  sourcing it from the Keychain or a separate 600 env file the daemon reads at
+  startup) — is a future improvement; `chmod 600` is the accepted minimum for now.
+- Spawned sessions run **unattended and, by default, fully autonomous**
+  (`spawned_mode: "auto-allow"`): a phone message can drive a session that edits
+  files and runs tools with no approval round-trip. Only enable `/new` if you accept
+  that. Set `spawned_mode: "ask"` in `permissions.json` to route the riskier
+  approvals (Write/Edit/non-allowlisted MCP) back to your phone as tap-to-approve.
 
 ## Caveats
 
@@ -208,14 +303,19 @@ telegram-bridge start|stop|restart|status|log
   (systemd) service layer is a TODO.
 - **Claude Code specific.** The in-session poll loop is a session-scoped cron, a
   Claude Code feature. This is not a generic LLM/agent bridge.
-- **gstack coupling.** Context save/restore and the compaction handoff call
-  gstack skills by default. Without them, follow
-  [Decoupling from gstack](#decoupling-from-gstack).
+- **gstack coupling (auto-compaction only).** The compaction handoff needs a
+  save/restore mechanism and defaults to gstack's `/context-save` /
+  `/context-restore`. Restore-on-startup and journal-on-`/end` are no longer baked
+  in — they're opt-in via the preamble seam. See
+  [Customizing agent behavior](#customizing-agent-behavior).
 - **Telegram setup gotchas.** The group MUST have **topics/forum mode enabled**,
   and the bot MUST be a group **admin** to create topics and read messages.
-- **Elevated autonomy.** Spawned sessions (`/new`) run unattended with broad tool
-  access. A phone message can drive a session that edits files and runs commands.
-  Only enable `/new` if you accept that. See [Security notes](#security-notes).
+- **Elevated autonomy (default).** Spawned sessions (`/new`) run unattended with
+  broad tool access and, by default (`spawned_mode: "auto-allow"`), no approval
+  round-trip. A phone message can drive a session that edits files and runs
+  commands. Only enable `/new` if you accept that; set `spawned_mode: "ask"` for
+  tap-to-approve. See [Security notes](#security-notes) and
+  [Known issues](#known-issues).
 - **Single owner.** Bootstraps to one Telegram user; not multi-user.
 
 ## License

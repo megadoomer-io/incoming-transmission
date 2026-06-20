@@ -46,7 +46,7 @@ Phone topic <── telegram-send.sh ─┘
 
 - Daemon installed and running: `telegram-bridge status` shows `running` with a
   non-null `chat_id`. If `chat_id` is null, the bridge hasn't been bootstrapped —
-  send `@mcd_claude_bot` any message once (in the control group) so the daemon
+  send your bridge bot any message once (in the control group) so the daemon
   captures the chat, then retry.
 - `TELEGRAM_BRIDGE_BOT_TOKEN` in the environment (from `dotfiles-secrets sync`).
 
@@ -241,7 +241,7 @@ that topic on their phone.
 | `/status` | Show this session's cwd and processed count |
 | `/context` | Report the live context gauge (pct, tokens, window, msgs) — non-destructive |
 | `/compact` | Roll this session over to a fresh one now, preserving working state |
-| `/end` | Detach: `/track` + `/context-save` first (preserve + checkpoint), then close the topic, remove the cron + registry |
+| `/end` | Detach: close the topic, remove the cron + registry. (Optionally preserve work first via a `bridge-preamble.txt` that asks for journal/checkpoint — see "Customizing agent behavior" in the README) |
 | `/dir <name\|path>` | Change working dir. `<name>` is resolved against `~/.telegram-bridge/dir-aliases.json` (case-insensitive); otherwise treated as a literal path |
 | `/dirs` | List the available directory aliases |
 
@@ -251,7 +251,7 @@ on a phone and the bot registers these names with Telegram (`setMyCommands`), so
 the `/` menu offers them as tappable suggestions.
 
 In a group, tapping a command from Telegram's slash-menu appends the bot handle
-(e.g. `/end@mcd_claude_bot`). The router's `normalize_command()` strips that
+(e.g. `/end@your_bot`). The router's `normalize_command()` strips that
 `@botname` suffix from the leading command token before routing, so the suffixed
 and bare forms are equivalent for both session-level and daemon-level commands.
 This also means already-running sessions get the fix for free — they read the
@@ -316,9 +316,12 @@ so at the trigger threshold the session does a *handoff*: `/context-save` → sp
 fresh replacement in the SAME topic (attach mode) → the replacement `/context-restore`s,
 attaches, and takes over → the old session stops. A per-topic mkdir lock plus a
 `compacting.lock` / `handoff-ready` handshake guarantee the two pollers never overlap
-and no message is dropped or double-answered across the cutover. This uses the gstack
-`/context-save` + `/context-restore` skills (controllable and near-lossless), with
-Claude Code's native auto-compact still underneath as a safety net.
+and no message is dropped or double-answered across the cutover. The handoff needs a
+save/restore mechanism to carry context across: the default install uses the gstack
+`/context-save` + `/context-restore` skills (controllable and near-lossless), but the
+save step writes a plain handoff file (`SESS/context-restore.md`) the replacement
+reads, so you can point it at your own mechanism — see "Customizing agent behavior" in
+the README. Claude Code's native auto-compact still sits underneath as a safety net.
 
 **Tuning** (`~/.telegram-bridge/compaction.json`, read live — no restart):
 
@@ -380,13 +383,14 @@ also accepts a short alias from `~/.telegram-bridge/dir-aliases.json` (e.g.
 `/telegram`. The new session opens its own topic (named from cwd/branch) and
 posts there once ready.
 
-The spawn prompt also has the new session invoke `/context-restore` first, so a
-`/new <repo>` starts already loaded with that project's last saved checkpoint (it
-labels the age; "no saved context" is a fine no-op for a fresh repo). This pairs
-with `/end` running `/track` + `/context-save` on the way out: end a session and
-its work is journaled and checkpointed, then the next `/new` for that project
-picks up where it left off. Interactive (non-bridge) sessions get the same nudge
-from the global `gstack-context-restore-nudge` SessionStart hook.
+By default the spawn prompt carries ONLY transport mechanics (attach via
+`/telegram`, then wait). Any operator style — including "restore prior context on
+startup" or "journal + checkpoint on `/end`" — is opt-in via the preamble seam
+(`spawn-preamble.txt` for spawns, `bridge-preamble.txt` for bridged sessions). See
+"Customizing agent behavior" in the README. For example, a spawn-preamble that
+runs `/context-restore` first makes `/new <repo>` start already loaded with that
+project's last saved checkpoint; pairing it with a bridge-preamble that runs
+`/context-save` on `/end` lets the next `/new` pick up where the last left off.
 
 Key design points:
 
@@ -407,8 +411,18 @@ Key design points:
 
 ## Permissions in spawned sessions (Tier 2)
 
-A spawned session runs unattended, so a local permission prompt would hang the
-pane. `telegram-permission-hook.py` (a PreToolUse hook wired in
+> **⚠️ The shipped default is `spawned_mode: "auto-allow"` — fully autonomous, NO
+> approval round-trip.** In that mode a spawned session auto-runs gated tools
+> (Write/Edit/MCP) and answers its own questions; nothing is sent to your phone for
+> approval. A message you send can drive a session that edits files and runs tools
+> with no tap-to-approve gate. The tap-to-approve flow described below only happens
+> when you set `spawned_mode: "ask"` in `~/.telegram-bridge/permissions.json`.
+> Whether `auto-allow` should be the default is a pending decision (see the
+> KNOWN ISSUES note in the README) — it ships this way because the approval
+> round-trip is not yet end-to-end tested.
+
+With `spawned_mode: "ask"`: a spawned session runs unattended, so a local permission
+prompt would hang the pane. `telegram-permission-hook.py` (a PreToolUse hook wired in
 `~/.claude/settings.local.json`, NOT the shared `settings.json`) routes approval
 requests for `Write`/`Edit`/`NotebookEdit`/`WebFetch` and any non-allowlisted
 MCP tool (`mcp__*`) to the session's topic: it posts the change preview with
@@ -471,6 +485,6 @@ blocks, the session is busy so its poll cron doesn't contend.
 | `telegram-bridge stop` | Stop it |
 | `telegram-bridge status` | Status, owner, chat id, attached topics |
 | `telegram-bridge log` | Tail the router log |
-| `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.telegram.watchdog.plist` | Start the wedge watchdog |
-| `launchctl bootout gui/$(id -u)/com.telegram.watchdog` | Stop the wedge watchdog |
+| `telegram-bridge watchdog-start` | Start the wedge watchdog (renders + loads its plist) |
+| `telegram-bridge watchdog-stop` | Stop the wedge watchdog |
 | `telegram-watchdog.py --dry-run` | Scan panes now, print findings, send nothing |
