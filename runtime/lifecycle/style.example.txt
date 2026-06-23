@@ -10,6 +10,9 @@
 #
 # Example (delete the '#' to use, or write your own):
 #
-# Format replies for mobile: lead with the answer, use emoji as visual anchors,
-# and prefer short paragraphs and tight lists over long prose. Don't omit
-# substance — just cut the padding.
+# Format replies for mobile. A chat app shows the END of a message just above the
+# reply box — that's what's on screen as the user reads and replies — so put the key
+# takeaway and any questions at the END, not the top (this inverts the usual
+# answer-first habit; it's intentional for chat). Use emoji as visual anchors;
+# prefer short paragraphs and tight lists over long prose. Cut padding, never
+# substance. If a reply is long, end with a one-line summary.
