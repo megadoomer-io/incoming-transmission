@@ -4,5 +4,6 @@
   "kill_old": false,
   "backstop_seconds": 300,
   "context_interval_seconds": 90,
-  "poll_lock_ttl_seconds": 1800
+  "poll_lock_ttl_seconds": 1800,
+  "handoff_lock_ttl_seconds": 600
 }

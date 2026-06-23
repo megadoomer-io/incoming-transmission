@@ -250,7 +250,7 @@ known and pending the first end-to-end test:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds` |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds` |
 | `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
 | `lifecycle/{style,start,save,end}.txt` | per-event behavior hooks (read live; gitignored). See [Customizing agent behavior](#customizing-agent-behavior) |
 

@@ -651,6 +651,52 @@ def compute_status(reg, tkey):
         log("context: compute failed for topic {}: {}".format(tkey, e))
 
 
+def _pid_alive(pid):
+    """True if the process is alive. os.kill(pid, 0) signals nothing but raises
+    ProcessLookupError if the pid is gone."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user (same-user here; defensive)
+
+
+def _reclaim_stale_locks(reg, tkey, poll_ttl, handoff_ttl):
+    """Clear a stale poll.lock.d / compacting.lock so a dead or abandoned drain or
+    handoff can't wedge the topic (issue #8, FM1/FM2/FM5). A lock is stale when the
+    session's claude_pid is dead, OR the lock's own mtime (its acquire time) is older
+    than its TTL. pid-death is the fast, unambiguous signal; the TTL is the backstop
+    for a session that is alive but abandoned its lock. The session also self-heals
+    its own poll.lock.d in the drain procedure, but the router is the ONLY rescuer
+    once the session process is gone."""
+    cpid = reg.get("claude_pid")
+    pid_dead = cpid is not None and not _pid_alive(cpid)
+    now = time.time()
+    sess = INBOX_ROOT / tkey
+    poll = sess / "poll.lock.d"
+    try:
+        if poll.is_dir():
+            age = now - poll.stat().st_mtime
+            if pid_dead or age > poll_ttl:
+                poll.rmdir()
+                log("reclaimed stale poll.lock.d for topic {} (pid_dead={}, age={:.0f}s)".format(
+                    tkey, pid_dead, age))
+    except OSError:
+        pass
+    comp = sess / "compacting.lock"
+    try:
+        if comp.is_file():
+            age = now - comp.stat().st_mtime
+            if pid_dead or age > handoff_ttl:
+                comp.unlink()
+                log("reclaimed stale compacting.lock for topic {} (pid_dead={}, age={:.0f}s)".format(
+                    tkey, pid_dead, age))
+    except OSError:
+        pass
+
+
 def context_loop():
     """Daemon thread: the router's timing engine, OFF the getUpdates path (a big
     transcript scan or a re-nudge must never stall the message pump). On each
@@ -671,6 +717,8 @@ def context_loop():
         interval = max(15, int(cfg.get("context_interval_seconds", 90) or 90))
         trigger = cfg.get("trigger_pct", 0.85)
         backstop = max(60, int(cfg.get("backstop_seconds", 300) or 300))
+        poll_lock_ttl = max(60, int(cfg.get("poll_lock_ttl_seconds", 1800) or 1800))
+        handoff_lock_ttl = max(60, int(cfg.get("handoff_lock_ttl_seconds", 600) or 600))
         if REGISTRY_DIR.is_dir():
             for f in REGISTRY_DIR.glob("*.json"):
                 tkey = f.stem
@@ -681,6 +729,10 @@ def context_loop():
                 if reg.get("thread_id") is None:
                     continue
                 compute_status(reg, tkey)
+                # Clear a stale poll.lock.d / compacting.lock first, so a dead or
+                # abandoned drain/handoff can't wedge the topic and block the
+                # compaction + backstop checks below (issue #8, FM1/FM2/FM5).
+                _reclaim_stale_locks(reg, tkey, poll_lock_ttl, handoff_lock_ttl)
                 # Router-driven compaction trigger detection. Guard on
                 # compacting.lock so we nudge once, not every interval while the
                 # session is mid-handoff (the session creates the lock when it
