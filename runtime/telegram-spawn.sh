@@ -90,8 +90,9 @@ SHARED="claude"
 win="$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
 # The new session self-attaches: /telegram creates its own topic (named from the
-# cwd/branch) and starts its own idle poll cron. TELEGRAM_BRIDGE_SPAWNED=1 also
-# activates the Tier-2 permission hook for this session only.
+# cwd/branch) and loads the bridge procedure (no cron — the router drives timing).
+# TELEGRAM_BRIDGE_SPAWNED=1 also activates the Tier-2 permission hook for this
+# session only.
 #
 # Compaction-replacement mode: when --attach (and usually --restore) were passed,
 # this spawn is a handoff replacement for a session whose context filled. It must
@@ -125,7 +126,7 @@ spawn_mechanism="Transport note: you were spawned UNATTENDED (no human at this t
 if [ -n "$ATTACH_THREAD" ]; then
     prompt="You are a compaction replacement for a Telegram-bridged session whose context filled up. Do these IN ORDER, then wait for instructions:
 1. Restore the prior working context from the handoff file: ${RESTORE_FILE}
-2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then start the poll cron.
+2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then load the bridge procedure and do an initial drain (it runs no cron — the router drives timing).
 3. Continue the restored work.
 
 ${spawn_mechanism}"

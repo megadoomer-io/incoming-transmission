@@ -6,11 +6,11 @@
 # this stuff is worth it, you can buy me a beer in return.
 # ----------------------------------------------------------------------------
 #
-# poll-render: instantiate the bridge poll-cron prompt from the template for a
-# specific session. The session-scoped poll cron is created with this rendered
-# text; the prompt's BACKOFF RESCHEDULE step re-renders via this same helper, so
-# the literal {{...}} placeholders live ONLY here and in poll-prompt.tmpl — never
-# in a live prompt (where spawn-time substitution would clobber them).
+# poll-render: instantiate the bridge procedure from the template for a specific
+# session. The session loads this rendered text into context at attach (it runs no
+# cron — the router drives all timing); the literal {{...}} placeholders live ONLY
+# here and in poll-prompt.tmpl — never in a live prompt (where spawn-time
+# substitution would clobber them).
 #
 # Usage:  poll-render.sh THREAD_ID CHAT_ID INBOX CWD
 # Emits the rendered prompt on stdout.

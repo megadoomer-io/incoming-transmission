@@ -61,7 +61,7 @@ CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
 # shipped compaction.json.
 CONFIG_FILE = BRIDGE_DIR / "compaction.json"
 CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
-                   "context_interval_seconds": 90}
+                   "context_interval_seconds": 90, "backstop_seconds": 300}
 
 LONG_POLL_SECONDS = 30
 # socket timeout must exceed the long-poll window so the connection isn't torn
@@ -82,6 +82,13 @@ CAFFEINATE_BIN = "/usr/bin/caffeinate"
 
 _running = True
 _caffeinate = None  # Popen handle for the keep-awake child
+# Backstop throttle: monotonic timestamp of the last drain nudge per topic key.
+# Written by wake_session (on both the main thread's push and the context
+# thread's backstop) and read by the context loop to avoid re-nudging an
+# undrained inbox more often than backstop_seconds. Dict get/set is atomic under
+# the GIL; this is best-effort throttling, so the rare cross-thread race (one
+# extra or one skipped nudge) is harmless.
+_backstop_nudged_at = {}
 
 
 def start_caffeinate():
@@ -221,7 +228,7 @@ def clear_buttons(chat_id, message_id):
 # Each attached topic shows a phone-can't-see-the-statusbar gauge as a pinned
 # message: "cwd · N msgs · ~XX% ctx · updated HH:MM", with ⚠️ past the warn
 # threshold. The numbers come from each topic's status.json (written by the
-# session's poll cron). We own a per-thread sidecar in STICKY_DIR so we never
+# router's context_loop). We own a per-thread sidecar in STICKY_DIR so we never
 # race the /telegram skill's registry writes, and we only call editMessageText
 # when the rendered text actually changed (avoids 429s and "not modified" 400s).
 
@@ -242,6 +249,28 @@ def read_status(tkey):
         return json.loads(f.read_text())
     except (ValueError, OSError):
         return None
+
+
+def undrained_count(reg):
+    """How many inbox lines the session has not yet consumed: total inbox lines
+    minus SESS/read.offset (the count the session writes back after a drain). >0
+    means messages are waiting for the session to read them. Best-effort — any
+    read error returns 0 (assume drained) so the backstop never spins on a
+    transient fs hiccup."""
+    try:
+        inbox = Path(reg.get("inbox_path", ""))
+        if not inbox.is_file():
+            return 0
+        with inbox.open() as fh:
+            total = sum(1 for _ in fh)
+        off_f = inbox.parent / "read.offset"
+        try:
+            offset = int((off_f.read_text().strip() or "0"))
+        except (ValueError, OSError):
+            offset = 0
+        return max(0, total - offset)
+    except OSError:
+        return 0
 
 
 def load_sticky(tkey):
@@ -368,7 +397,7 @@ def update_stickies(state):
 #   daemon-handled  : new, sessions, whoami, help        (handled here, any topic)
 #   session-handled : status, context, compact, dir,     (routed to the attached
 #                     dirs, end                           session's inbox; the
-#                                                         session's poll cron acts)
+#                                                         session drains + acts)
 # context/compact have NO handler below, so they fall through to the routing path
 # like status/dir — the session executes them. Names must be 1-32 chars, lowercase
 # a-z/0-9/_. Order = menu order.
@@ -472,10 +501,10 @@ HELP = (
 )
 
 
-# --- wake (Phase 2): nudge a backed-off session's tmux pane to poll NOW --------
+# --- wake: nudge a session's tmux pane to DRAIN its inbox NOW ------------------
 # Best-effort and ADDITIVE: wake runs only AFTER a message is already in the
-# inbox, so any failure here never affects delivery (backoff still bounds the
-# fallback latency). Pane matching is STRICT — a pane is only nudged when its
+# inbox, so any failure here never affects delivery (the router's backstop still
+# bounds the fallback latency). Pane matching is STRICT — a pane is only nudged when its
 # live `claude` pid equals the topic's registry claude_pid — so keystrokes can
 # never land in the wrong pane (an interactive session, another topic).
 TMUX_BIN = os.environ.get("TELEGRAM_BRIDGE_TMUX", "/opt/homebrew/bin/tmux")
@@ -572,16 +601,27 @@ def _nudge_pane(reg, text, kind):
 def wake_session(reg):
     """Push delivery (PRIMARY path): nudge the topic's pane to DRAIN its inbox now.
 
-    In the smart-router / dumb-session model the session has no fast poll cron,
-    only a slow fallback heartbeat — so a message waits on this nudge (or, if the
-    nudge is missed, the heartbeat) to be drained. The session's heartbeat prompt
-    defines section A (the drain procedure) that this nudge refers to."""
+    In the smart-router / dumb-session model the session runs NO cron at all — it
+    is purely reactive. A message waits on this push nudge (issued the instant the
+    router routes it) or, if the nudge was missed (session busy, pane briefly
+    gone), on the router's backstop re-nudge from context_loop. Either way the
+    router owns all timing; the session just drains when told.
+
+    The nudge is self-contained for the common case (it lists the drain steps
+    inline) so a session whose attach-time bridge procedure has since compacted
+    away can still drain from the nudge alone."""
     thread_id = reg.get("thread_id")
-    nudge = ("TELEGRAM WAKE {tid}: a message arrived. Run section A (DRAIN INBOX) of "
-             "your heartbeat poll prompt NOW: take the SESS/poll.lock.d lock, read new "
-             "lines after SESS/read.offset, reply to each, advance read.offset, release "
-             "the lock. The router owns timing and your context gauge.").format(tid=thread_id)
+    nudge = ("TELEGRAM WAKE {tid}: a message arrived. DRAIN INBOX now (section A of your "
+             "bridge procedure): mkdir SESS/poll.lock.d, read lines after SESS/read.offset, "
+             "reply to each, write the new line count to SESS/read.offset, rmdir the lock. "
+             "The router owns timing and your context gauge — you have no cron.").format(tid=thread_id)
     _nudge_pane(reg, nudge, "wake")
+    # Throttle the backstop: record this attempt regardless of whether a pane was
+    # found, so context_loop waits backstop_seconds before re-nudging (a missing
+    # pane means a dead session; re-nudging it every tick would spin).
+    tkey = Path(reg.get("inbox_path", "")).parent.name
+    if tkey:
+        _backstop_nudged_at[tkey] = time.monotonic()
 
 
 def nudge_compact(reg):
@@ -591,7 +631,7 @@ def nudge_compact(reg):
     the router can only ask; the session no longer self-checks pct."""
     thread_id = reg.get("thread_id")
     nudge = ("TELEGRAM WAKE {tid}: /compact — your context gauge crossed the trigger. "
-             "Run the COMPACTION HANDOFF from your heartbeat poll prompt now (save context, "
+             "Run the COMPACTION HANDOFF from your bridge procedure now (save context, "
              "spawn a fresh replacement in this same topic, hand off).").format(tid=thread_id)
     _nudge_pane(reg, nudge, "compact")
 
@@ -613,17 +653,25 @@ def compute_status(reg, tkey):
 
 
 def context_loop():
-    """Daemon thread: refresh every attached topic's context gauge on a fixed
-    interval, OFF the getUpdates path (a big transcript scan must never stall the
-    router's message pump). After each refresh, if a session has crossed
-    trigger_pct and is not already compacting, nudge it to run its handoff.
+    """Daemon thread: the router's timing engine, OFF the getUpdates path (a big
+    transcript scan or a re-nudge must never stall the message pump). On each
+    interval, for every attached topic it:
 
-    update_stickies() (on the main loop) still just READS the status.json this
-    thread writes and edits the pin — fast, no scan."""
+      1. refreshes the context gauge (writes status.json the main loop reads),
+      2. nudges /compact if the session crossed trigger_pct (and isn't already
+         handing off),
+      3. backstops delivery: re-nudges a DRAIN if the inbox is still undrained
+         (the push nudge in handle_message was missed), throttled to
+         backstop_seconds and skipped entirely when the inbox is drained.
+
+    This is what lets the session run NO cron: the router both pushes on arrival
+    and re-pushes undrained inboxes. update_stickies() (on the main loop) still
+    just READS the status.json this thread writes — fast, no scan."""
     while _running:
         cfg = load_compaction_cfg()
         interval = max(15, int(cfg.get("context_interval_seconds", 90) or 90))
         trigger = cfg.get("trigger_pct", 0.85)
+        backstop = max(60, int(cfg.get("backstop_seconds", 300) or 300))
         if REGISTRY_DIR.is_dir():
             for f in REGISTRY_DIR.glob("*.json"):
                 tkey = f.stem
@@ -643,6 +691,16 @@ def context_loop():
                 lock = INBOX_ROOT / tkey / "compacting.lock"
                 if pct is not None and pct >= trigger and not lock.exists():
                     nudge_compact(reg)
+                # Backstop the push delivery. handle_message nudges the moment it
+                # routes a message; if that nudge was missed (session mid-task, or
+                # the pane was briefly gone) the inbox stays undrained — re-issue
+                # the drain nudge, but ONLY while something is actually undrained
+                # and no more than once per backstop_seconds. A drained inbox is
+                # never nudged, so an idle session costs zero tokens. Skip while a
+                # handoff is in flight (the session is busy compacting).
+                elif undrained_count(reg) > 0 and not lock.exists():
+                    if (time.monotonic() - _backstop_nudged_at.get(tkey, 0.0)) >= backstop:
+                        wake_session(reg)
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:

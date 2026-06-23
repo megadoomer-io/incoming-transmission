@@ -13,12 +13,15 @@ documented, user-amendable seam (default = normal Claude).
   (a) **pushes** a one-line drain nudge to the session's pane the moment a message
   arrives (primary delivery), (b) computes each session's context gauge itself on a
   dedicated thread (`context_loop`, off the getUpdates path), and (c) detects the
-  compaction trigger and nudges the session to hand off. The session is reduced to a
-  "dumb" processor: it runs ONE slow fallback heartbeat cron (`heartbeat_seconds`,
-  default 30m) for a missed push and drains on nudge — the adaptive backoff ladder
-  (`idle.count`/`poll.level`/`idle_intervals_seconds`/`ticks_per_rung`) and the
-  session-side status gauge are gone. `compaction.json` swaps the `polling` ladder
-  for `heartbeat_seconds` + `context_interval_seconds`. `poll-prompt.tmpl`,
+  compaction trigger and nudges the session to hand off, and (d) **backstops**
+  delivery — if a pushed message stays undrained it re-nudges, throttled to
+  `backstop_seconds` and only while the inbox is non-empty. The session is reduced to
+  a "dumb" processor that runs NO cron at all: it loads the bridge procedure at attach
+  and drains purely on the router's nudges — the adaptive backoff ladder
+  (`idle.count`/`poll.level`/`idle_intervals_seconds`/`ticks_per_rung`), the
+  session-side status gauge, and the session heartbeat cron are all gone.
+  `compaction.json` swaps the `polling` ladder for `backstop_seconds` +
+  `context_interval_seconds`. `poll-prompt.tmpl`,
   `telegram-router.py`, the `/telegram` skill, and the README are updated together.
   **UNTESTED end-to-end** (no live token); the wake path in particular
   (send-keys into a busy TUI) is unverified pending the first test pass.

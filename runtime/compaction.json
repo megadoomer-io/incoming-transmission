@@ -2,6 +2,6 @@
   "trigger_pct": 0.85,
   "warn_pct": 0.75,
   "kill_old": false,
-  "heartbeat_seconds": 1800,
+  "backstop_seconds": 300,
   "context_interval_seconds": 90
 }

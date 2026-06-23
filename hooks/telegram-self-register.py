@@ -9,8 +9,8 @@ later bind the right transcript to its topic.
 
 At `/telegram` attach the skill picks the newest-mtime transcript among same-cwd
 records (the attaching session's transcript is being written *right now*, so it wins)
-and records that path into `registry/<thread>.json`. The poll cron then reads context
-occupancy from that path each tick.
+and records that path into `registry/<thread>.json`. The router then reads context
+occupancy from that path each interval.
 
 Fires for EVERY session (cheap, stdlib-only) since we can't know at startup which one
 will attach. Records pointing at vanished transcripts are pruned. Never fails session

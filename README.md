@@ -80,9 +80,9 @@ Phone topic <──────────────────────�
   one-line drain nudge. A separate thread computes each session's context gauge and
   triggers compaction — off the getUpdates path.
 - **`/telegram`** (a Claude Code skill — see `skill/`) creates the topic, registers
-  ownership, does an initial drain, and starts ONE slow **fallback heartbeat** cron
-  (for a missed push). Processing is in-session, so a message never interrupts
-  running work.
+  ownership, loads the bridge procedure, and does an initial drain. The session runs
+  NO cron — the router pushes on arrival and re-pushes anything left undrained.
+  Processing is in-session, so a message never interrupts running work.
 - **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
   safety net for a session wedged on an interactive prompt nobody can answer.
 
@@ -90,9 +90,10 @@ Phone topic <──────────────────────�
 
 - **One reader, many sessions** — single-consumer routing by topic; no polling collisions.
 - **Push delivery** — the router `send-keys` a drain nudge to the session's pane
-  (matched by pid identity) the moment a message arrives. No fast poll cron; a single
-  slow heartbeat (default 30m) backstops a missed push. The nudge is a drain
-  imperative only — payload always travels via the inbox.
+  (matched by pid identity) the moment a message arrives. The session runs no cron;
+  the router backstops a missed push by re-nudging any undrained inbox (default every
+  5m, only while non-empty). The nudge is a drain imperative only — payload always
+  travels via the inbox.
 - **Context gauge** — the router computes each session's occupancy on its own thread
   and shows it on a pinned per-topic sticky: `cwd · N msgs · ~XX% ctx`.
 - **Auto-compaction (PAK transfer)** — at a context threshold the session saves
@@ -261,7 +262,7 @@ known and pending the first end-to-end test:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `heartbeat_seconds`, `context_interval_seconds` |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds` |
 | `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
 | `spawn-preamble.txt` | optional operator style for `/new` spawns (empty by default; gitignored) |
 | `bridge-preamble.txt` | optional operator style for bridged sessions (empty by default; gitignored) |
