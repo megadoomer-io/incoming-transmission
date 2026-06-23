@@ -85,9 +85,13 @@ fi
 
 # Every spawn lands as a WINDOW (a tab) in one shared "claude" tmux session, so
 # `tmux attach -t claude` shows them all as tabs — cycle with prefix + Tab. The
-# window is named for the repo so the tab is recognizable.
+# window is named "tg:<repo>" so the tab is recognizable AND visibly marked as
+# bridge-managed (distinguishing it from any manually-opened claude window in the
+# same session). The "tg:" prefix is added OUTSIDE the tr so its ":" survives the
+# charset filter; ":" is safe in a tmux window name because the code only ever
+# targets windows by index or $TMUX_PANE, never by name.
 SHARED="claude"
-win="$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
+win="tg:$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
 # The new session self-attaches: /telegram creates its own topic (named from the
 # cwd/branch) and loads the bridge procedure (no cron — the router drives timing).
