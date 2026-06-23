@@ -9,13 +9,12 @@ you two ways, both via tmux send-keys:
   - BACKSTOP: if the inbox is still undrained later (a push landed while you were
     busy, or the pane was briefly gone) it re-nudges, no more than every
     backstop_seconds, and never while the inbox is empty.
-The router also computes your context gauge itself (you no longer write
-SESS/status.json) and tells you when to compact (section B).
+The router also computes your context gauge (it writes SESS/status.json) and
+tells you when to compact (section B).
 
 This text is the canonical definition of your DRAIN and COMPACTION procedures —
 a wake nudge just says "run section A" or "run the compaction handoff", so keep
-this in context. There is no backoff ladder, no idle.count, no poll.level, no
-poll cron. You are purely reactive: act when nudged, then go idle.
+this in context. You are purely reactive: act when nudged, then go idle.
 
 STYLE: before you reply to anything, read ~/.telegram-bridge/lifecycle/style.txt and
 follow it for every reply this session (ignore #-comment lines; if empty, reply with
@@ -37,8 +36,8 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
       e. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/"
          (preferred) or "!" (legacy), case-insensitive; strip the prefix first:
            /status  -> reply with cwd + message count processed
-           /context -> reply with the live context gauge: read SESS/status.json (the
-                       ROUTER writes it now) and report pct, tokens, window, msgs
+           /context -> reply with the live context gauge: read SESS/status.json (written
+                       by the router) and report pct, tokens, window, msgs
            /compact -> run COMPACTION HANDOFF (below) right now
            /dir <name|path> -> resolve against ~/.telegram-bridge/dir-aliases.json
                        (case-insensitive); else literal path (~ expanded). Note the change.
@@ -47,7 +46,6 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
                        ~/.telegram-bridge/lifecycle/end.txt (ignore #-comment lines;
                        may be empty = no extra actions). THEN deregister: rm the
                        registry file, closeForumTopic, reply "Session detached."
-                       There is no cron to delete.
          Only those SIX are bridge commands. Any OTHER "/" text (/track, /ship,
          /review, ...) is NOT a bridge command — treat it as a task so skills can be
          driven from the phone. (Daemon-level /new, /whoami, /sessions, /help never
@@ -60,9 +58,6 @@ B. COMPACTION — the ROUTER detects the context trigger, not you. When it sees 
    above, or as a direct wake nudge). You do NOT self-check pct. Run COMPACTION
    HANDOFF below whenever you receive /compact. (Claude Code's native auto-compact
    remains the ultimate backstop if the router's detection is ever down.)
-
-There is no section C/D — backoff, scheduling, and the status gauge all moved to
-the router.
 
 COMPACTION HANDOFF (run from the /compact command):
    You cannot shrink your own live context, so roll over to a FRESH replacement that
@@ -82,7 +77,7 @@ COMPACTION HANDOFF (run from the /compact command):
         - Not appearing in time: post "⚠️ compaction replacement didn't report ready;
           staying live.", rm SESS/compacting.lock, and ABORT (keep running normally).
    6. Hand off: rm SESS/compacting.lock. This releases the replacement to begin
-      draining (the router resumes pushing/backstopping it). You have no cron to delete.
+      draining (the router resumes pushing/backstopping it).
    7. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "✅ compacted — fresh session is live."
    8. Retire this tmux window for cleanup — ONLY if this session was spawned by the
       bridge (env TELEGRAM_BRIDGE_SPAWNED=1) AND $TMUX_PANE is set. Otherwise SKIP.

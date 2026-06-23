@@ -51,8 +51,7 @@ INBOX_ROOT = Path("/tmp/claude-telegram/sessions")
 BRIDGE_DIR = Path.home() / ".telegram-bridge"
 SPAWN_SCRIPT = BRIDGE_DIR / "telegram-spawn.sh"
 # Context gauge: in the smart-router / dumb-session model the router computes each
-# attached session's context occupancy itself (the session no longer self-polls).
-# It shells out to the same telegram-context.py the sessions used to run, on its
+# attached session's context occupancy. It shells out to telegram-context.py on its
 # own timer thread (OFF the getUpdates path so a big transcript scan can't stall
 # message routing).
 CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
@@ -628,7 +627,7 @@ def nudge_compact(reg):
     """Router-driven compaction: when the context thread sees a session cross
     trigger_pct (and it is not already compacting), nudge it to run its COMPACTION
     HANDOFF. Only the live process can /context-save + spawn its replacement, so
-    the router can only ask; the session no longer self-checks pct."""
+    the router can only ask; the session runs the handoff when nudged."""
     thread_id = reg.get("thread_id")
     nudge = ("TELEGRAM WAKE {tid}: /compact — your context gauge crossed the trigger. "
              "Run the COMPACTION HANDOFF from your bridge procedure now (save context, "
@@ -638,9 +637,9 @@ def nudge_compact(reg):
 
 def compute_status(reg, tkey):
     """Run telegram-context.py for one topic so it (re)writes SESS/status.json.
-    The session no longer does this — the router owns the gauge. Best-effort with
-    a timeout so a huge transcript scan can't wedge the context thread; runs under
-    the router's own interpreter (context.py is pure stdlib python3)."""
+    The router owns the gauge. Best-effort with a timeout so a huge transcript scan
+    can't wedge the context thread; runs under the router's own interpreter
+    (context.py is pure stdlib python3)."""
     tp = reg.get("transcript_path")
     if not tp or not CONTEXT_SCRIPT.exists():
         return
