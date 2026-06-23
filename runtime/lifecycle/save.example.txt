@@ -1,0 +1,15 @@
+# save hook — persist context when a session ROLLS OVER (compaction handoff)
+#
+# Run by a session that is handing off to a fresh replacement. Lines starting with
+# '#' or blank are ignored.
+#
+# TRANSPORT REQUIREMENT (not optional): however you save, the result MUST end up at
+# SESS/context-restore.md — that is the file the replacement restores from. The
+# active line below is the agnostic default; replace it with your own mechanism but
+# keep that requirement.
+Write a brief summary of your current working state (what you're doing, key decisions made, what's left) to SESS/context-restore.md.
+#
+# Example with the gstack skills (delete the '#' AND remove the default line above):
+#
+# Invoke /track to journal the session, then /context-save to checkpoint it; copy
+# the saved file path it prints to SESS/context-restore.md.

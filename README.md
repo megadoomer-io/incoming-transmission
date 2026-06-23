@@ -61,31 +61,41 @@ The metaphor maps onto the architecture, so the docs and logs use it:
 
 ## How it fits together
 
+Smart router, dumb session: the Massive owns all timing (routing, push delivery,
+the context gauge, and compaction triggering); a session just drains its inbox when
+nudged.
+
 ```
 Phone topic ──> the Massive (router daemon, sole getUpdates reader) ──> session inbox
-                                                                            │
-                          in-session poll loop (fires on idle) reads inbox ─┘
-                                  │ processes in-session, replies
-Phone topic <── telegram-send.sh ─┘
+                     │  send-keys "drain now" nudge ───────────────┐
+                     │  context thread: gauge + compaction trigger   │
+                     ▼                                              ▼
+              status.json / pinned sticky          session drains inbox, replies
+Phone topic <───────────────────────── telegram-send.sh ◀──────────┘
 ```
 
 - **The Massive** (`telegram-router.py`, launchd) is the ONLY process that reads
   Telegram (getUpdates is single-consumer). It routes each message by
-  `message_thread_id` to that session's `inbox.jsonl`.
-- **`/telegram`** (a Claude Code skill — see `skill/`) creates the topic,
-  registers ownership, and starts an in-session poll (a session-scoped cron) that
-  drains the inbox and replies. The poll fires on idle, so a message never
-  interrupts running work.
+  `message_thread_id` to that session's `inbox.jsonl`, then **pushes** the session a
+  one-line drain nudge. A separate thread computes each session's context gauge and
+  triggers compaction — off the getUpdates path.
+- **`/telegram`** (a Claude Code skill — see `skill/`) creates the topic, registers
+  ownership, loads the bridge procedure, and does an initial drain. The session runs
+  NO cron — the router pushes on arrival and re-pushes anything left undrained.
+  Processing is in-session, so a message never interrupts running work.
 - **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
   safety net for a session wedged on an interactive prompt nobody can answer.
 
 ## Features
 
 - **One reader, many sessions** — single-consumer routing by topic; no polling collisions.
-- **Adaptive backoff** — polls every 60s while a conversation is active, ramps to
-  a slow cap when idle so an idle session doesn't burn context. A router-side
-  *wake* nudge pulls a new message immediately, so backoff never sits on a message.
-- **Context gauge** — a pinned per-topic sticky shows `cwd · N msgs · ~XX% ctx`.
+- **Push delivery** — the router `send-keys` a drain nudge to the session's pane
+  (matched by pid identity) the moment a message arrives. The session runs no cron;
+  the router backstops a missed push by re-nudging any undrained inbox (default every
+  5m, only while non-empty). The nudge is a drain imperative only — payload always
+  travels via the inbox.
+- **Context gauge** — the router computes each session's occupancy on its own thread
+  and shows it on a pinned per-topic sticky: `cwd · N msgs · ~XX% ctx`.
 - **Auto-compaction (PAK transfer)** — at a context threshold the session saves
   state, spawns a fresh replacement in the same topic, and hands off, with a lock
   + handshake so no message is dropped or double-answered. *(Requires a
@@ -182,50 +192,38 @@ Typed in the control group (handled by the Massive):
 
 The bridge ships agnostic: by default it injects only transport mechanics and lets
 the session behave like normal Claude (see
-[Philosophy](#philosophy-transport-not-workflow-opinion)). When you want to layer
-in your own operator style — autonomy posture, journaling, context save/restore,
-anything — there are a few clearly-marked seams. None of them are on by default.
+[Philosophy](#philosophy-transport-not-workflow-opinion)). Everything else — reply
+style, context restore, journaling, save-on-rollover — is a **lifecycle hook** you
+configure. None impose a workflow; the defaults make a fresh install behave like
+plain Claude over the transport.
 
-### The preamble seam (recommended)
+### Lifecycle hooks
 
-Two empty-by-default files are the supported place for your own behavioral text.
-The installer seeds them from `*.example.txt`; editing them never touches the
-shipped code, and they're gitignored so they stay yours.
+Four small text files in `~/.telegram-bridge/lifecycle/`, each run at one moment in
+a session's life. The session reads the relevant one **live** at that moment, so
+edits take effect on the next attach/rollover/`/end` with no restart. The installer
+seeds them from `*.example.txt` (which double as docs); lines starting with `#` and
+blank lines are ignored.
 
-| File (`~/.telegram-bridge/`) | Injected into | When |
-|------------------------------|---------------|------|
-| `spawn-preamble.txt` | the `/new` spawn prompt (`telegram-spawn.sh`) | unattended spawns |
-| `bridge-preamble.txt` | the bridged session's poll prompt (`poll-render.sh`) | human-in-the-loop sessions |
+| Hook | Runs when | Default (shipped) |
+|------|-----------|-------------------|
+| `style.txt` | every session, on attach — formats its replies | empty → normal formatting |
+| `start.txt` | a **spawned** session is born (`/new` or rollover replacement) — restore context | read the handoff file if present |
+| `save.txt` | a session **rolls over** (compaction handoff) — persist context | summarize state into the handoff |
+| `end.txt` | a session ends (`/end`) — before detaching | empty → just detach |
 
-Each ships as comments only (so the default is empty → no behavior change). Add
-plain instructions; lines starting with `#` and blank lines are ignored. Your text
-is prepended **ahead of** the transport mechanics, so it frames the session. The
-`.example.txt` files contain worked examples (autonomy posture for spawns,
-journal-on-`/end` for bridged sessions).
-
-### Context save/restore (the gstack touchpoints)
+`style`/`end` ship empty (pure preference). `start`/`save` ship a functional
+agnostic default, because rollover continuity needs *some* save/restore — but the
+mechanism is yours to swap. The one hard rule: whatever `save.txt` does, it MUST
+leave the handoff at `SESS/context-restore.md`, since that's what the replacement
+restores from. An interactive `/telegram` attach runs only `style` (it's already
+live; restoring would clobber it).
 
 This tool was extracted from a setup that uses [gstack](https://garryslist.org)
-skills for context save/restore. Three places reference them. They are no longer
-hardcoded into behavior, but the **auto-compaction handoff genuinely needs a
-save/restore mechanism** to carry context across the cutover, so its default still
-points at gstack. Adjust via the seams above or by editing the runtime:
-
-1. **Restore on startup** — there's no longer a baked-in `/context-restore`. To get
-   it back, add `Before anything else, run /context-restore` to `spawn-preamble.txt`
-   (and/or `bridge-preamble.txt`).
-2. **Preserve on `/end`** — `/end` is now transport-teardown only. To journal +
-   checkpoint first, add e.g. `On /end, run /track then /context-save before
-   detaching` to `bridge-preamble.txt`.
-3. **Auto-compaction handoff** (`poll-prompt.tmpl`, COMPACTION HANDOFF block) writes
-   a handoff file `SESS/context-restore.md` that the replacement restores from. The
-   default produces it with the gstack `/context-save` skill. Without that skill,
-   either point the save step at your own command (write its output to
-   `SESS/context-restore.md`), or disable the process handoff and rely on Claude
-   Code's **native auto-compact** (set `trigger_pct` high in `compaction.json` and
-   treat the section as warn-only).
-
-Making save/restore fully config-driven (a `context_skill` knob) is on the roadmap.
+skills, so each `*.example.txt` documents the gstack version as a commented
+example: `start` → `/context-restore`, `save`/`end` → `/track` + `/context-save`.
+Uncomment to use them, or write your own. Claude Code's **native auto-compact**
+remains the ultimate backstop if you leave the handoff machinery alone.
 
 ## Known issues
 
@@ -252,10 +250,9 @@ known and pending the first end-to-end test:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, polling ladder |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds` |
 | `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
-| `spawn-preamble.txt` | optional operator style for `/new` spawns (empty by default; gitignored) |
-| `bridge-preamble.txt` | optional operator style for bridged sessions (empty by default; gitignored) |
+| `lifecycle/{style,start,save,end}.txt` | per-event behavior hooks (read live; gitignored). See [Customizing agent behavior](#customizing-agent-behavior) |
 
 Identity (owner username, user id, chat id) is **not** in any file — it's captured
 into `~/.local/state/telegram-bridge/state.json` on first contact with the bot.
@@ -301,20 +298,20 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
 - **macOS only (for now).** The daemon + watchdog are launchd services and the
   installer renders launchd plists. The Python runtime is portable; a Linux
   (systemd) service layer is a TODO.
-- **Claude Code specific.** The in-session poll loop is a session-scoped cron, a
-  Claude Code feature. This is not a generic LLM/agent bridge.
-- **gstack coupling (auto-compaction only).** The compaction handoff needs a
-  save/restore mechanism and defaults to gstack's `/context-save` /
-  `/context-restore`. Restore-on-startup and journal-on-`/end` are no longer baked
-  in — they're opt-in via the preamble seam. See
-  [Customizing agent behavior](#customizing-agent-behavior).
+- **Claude Code specific.** Sessions are driven by `send-keys` into a Claude Code
+  TUI and rely on Claude Code skills, hooks, and MCP. This is not a generic
+  LLM/agent bridge.
+- **gstack defaults (configurable).** The lifecycle hooks ship a functional default
+  for the save/restore that rollover continuity needs; each example documents the
+  gstack version (`/context-save` / `/context-restore` / `/track`). Style,
+  restore-on-start, and journal-on-`/end` are all hooks, none baked into behavior.
+  See [Customizing agent behavior](#customizing-agent-behavior).
 - **Telegram setup gotchas.** The group MUST have **topics/forum mode enabled**,
   and the bot MUST be a group **admin** to create topics and read messages.
-- **Elevated autonomy (default).** Spawned sessions (`/new`) run unattended with
-  broad tool access and, by default (`spawned_mode: "auto-allow"`), no approval
-  round-trip. A phone message can drive a session that edits files and runs
-  commands. Only enable `/new` if you accept that; set `spawned_mode: "ask"` for
-  tap-to-approve. See [Security notes](#security-notes) and
+- **Elevated autonomy (default).** Spawned sessions (`/new`) run with broad tool
+  access and, by default (`spawned_mode: "auto-allow"`), no approval round-trip. A
+  phone message can drive a session that edits files and runs commands. Only enable
+  `/new` if you accept that; set `spawned_mode: "ask"` for tap-to-approve. See [Security notes](#security-notes) and
   [Known issues](#known-issues).
 - **Single owner.** Bootstraps to one Telegram user; not multi-user.
 

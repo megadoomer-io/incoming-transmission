@@ -13,9 +13,9 @@
 # WHY: the permission hook auto-resolves gated tools in SPAWNED sessions, but a
 # session can still wedge on a prompt the hook doesn't cover (a native prompt
 # from a pre-fix session, an ssh-add passphrase, a "trust this folder" dialog,
-# or a native AUQ fallback). When that happens the session is blocked, so its
-# OWN idle poll cron can't fire to rescue it. A separate watcher is the only
-# thing that can notice. This is that watcher.
+# or a native AUQ fallback). When that happens the session is blocked, so the
+# router's drain nudge just buffers behind the prompt and can't rescue it. A
+# separate watcher is the only thing that can notice. This is that watcher.
 #
 # v1 is ALERT-ONLY: it never sends keystrokes. It scans the `claude` tmux
 # session's panes, flags any pane sitting on a prompt for longer than the dwell
@@ -261,8 +261,8 @@ def main():
             excerpt = prompt_excerpt(tail)
             alert = (
                 "⚠️ Wedged session: window '{}' (pane {}) has been stuck "
-                "~{}m on a prompt:\n  {}\n\nIt can't rescue itself (its poll cron "
-                "can't fire while blocked). Attach with `tmux attach -t {}`, switch "
+                "~{}m on a prompt:\n  {}\n\nIt can't rescue itself (a drain nudge "
+                "can't run while it's blocked). Attach with `tmux attach -t {}`, switch "
                 "to that window, and answer the prompt.".format(
                     win_name, pane_id, mins, excerpt, TMUX_SESSION))
             log("ALERT pane={} win={} sig={} dwell={}s -> {}".format(

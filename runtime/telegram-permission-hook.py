@@ -259,8 +259,8 @@ def main():
         abstain()
 
     # Keep an unattended (spawned) session flowing: it must NEVER block on a
-    # human round-trip, because the idle poll cron that would deliver the answer
-    # can't fire while the session is blocked (self-deadlock). In "auto-allow"
+    # human round-trip, because the idle drain that would deliver the answer
+    # can't run while the session is blocked (self-deadlock). In "auto-allow"
     # mode (default) we resolve every gated tool synchronously here:
     #   - AskUserQuestion-style MCP tools -> DENY, so the model decides itself
     #     instead of stalling up to ~28m on the AUQ server's own timeout.

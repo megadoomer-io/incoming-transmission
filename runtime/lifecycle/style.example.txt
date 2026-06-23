@@ -1,0 +1,18 @@
+# style hook — how a BRIDGED session should format its replies (OPTIONAL)
+#
+# Read by every session when it attaches to a topic (interactive OR spawned).
+# Lines starting with '#' or blank are ignored. Empty (the default) = normal
+# Claude formatting.
+#
+# This is for the medium, not the message: a bridged session talks through a
+# phone, so formatting for mobile helps. Frame it as FORMAT, not brevity — cut
+# padding, never substance.
+#
+# Example (delete the '#' to use, or write your own):
+#
+# Format replies for mobile. A chat app shows the END of a message just above the
+# reply box — that's what's on screen as the user reads and replies — so put the key
+# takeaway and any questions at the END, not the top (this inverts the usual
+# answer-first habit; it's intentional for chat). Use emoji as visual anchors;
+# prefer short paragraphs and tight lists over long prose. Cut padding, never
+# substance. If a reply is long, end with a one-line summary.

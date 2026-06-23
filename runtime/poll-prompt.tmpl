@@ -1,116 +1,88 @@
-TELEGRAM TOPIC POLL — topic {{THREAD_ID}}, chat {{CHAT_ID}}, inbox {{INBOX}}, cwd {{CWD}}.
+TELEGRAM BRIDGE PROCEDURE — topic {{THREAD_ID}}, chat {{CHAT_ID}}, inbox {{INBOX}}, cwd {{CWD}}.
 Session dir: /tmp/claude-telegram/sessions/{{THREAD_ID}}  (call it SESS below).
 Bridge dir: ~/.telegram-bridge.
 
-A. STATUS GAUGE (every tick, first):
-   1. Read transcript_path from ~/.local/state/telegram-bridge/registry/{{THREAD_ID}}.json.
-   2. If non-empty, run (ignore a non-zero exit = no usage yet):
-        ~/.telegram-bridge/telegram-context.py --transcript "<transcript_path>" --thread {{THREAD_ID}}
-      This writes SESS/status.json; the router reads it to update the pinned sticky.
+You are a "dumb session" in the smart-router / dumb-session model: the router
+daemon owns all timing. You run NO cron and schedule nothing. The router drives
+you two ways, both via tmux send-keys:
+  - PUSH: the moment a message arrives it nudges you to DRAIN (section A).
+  - BACKSTOP: if the inbox is still undrained later (a push landed while you were
+    busy, or the pane was briefly gone) it re-nudges, no more than every
+    backstop_seconds, and never while the inbox is empty.
+The router also computes your context gauge (it writes SESS/status.json) and
+tells you when to compact (section B).
 
-B. AUTO-COMPACTION CHECK (every tick, after status):
-   1. Read trigger_pct from ~/.telegram-bridge/compaction.json (default 0.85).
-   2. Read pct from SESS/status.json. If pct >= trigger_pct AND SESS/compacting.lock
-      does NOT exist: run COMPACTION HANDOFF (below) and STOP this tick (don't also
-      drain messages or run backoff).
+This text is the canonical definition of your DRAIN and COMPACTION procedures —
+a wake nudge just says "run section A" or "run the compaction handoff", so keep
+this in context. You are purely reactive: act when nudged, then go idle.
 
-C. DRAIN INBOX (every tick, unless a handoff just ran):
-   Take a non-blocking per-topic lock so a replacement poller can't double-reply during
-   a cutover — if you can't get it, another poller is active, so skip the rest of this tick.
-   Use an atomic mkdir lock (portable across macOS + Linux; flock is NOT installed on
-   macOS, so do not use it):
-        mkdir SESS/poll.lock.d 2>/dev/null || (another poller active -> stop this tick)
-   Hold the lock (the directory's existence) for steps 1-4; always rmdir it when done.
-   1. Read read-offset from SESS/read.offset (default 0). Read {{INBOX}}; take lines after it.
-   2. Record how many NEW lines there are as DRAINED (0 if none). If 0, skip to step 4
-      (do NOT stop the tick — section D still runs so backoff can advance).
+STYLE: before you reply to anything, read ~/.telegram-bridge/lifecycle/style.txt and
+follow it for every reply this session (ignore #-comment lines; if empty, reply with
+normal formatting).
+
+A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
+   1. Take a non-blocking per-topic lock so a push drain and a backstop re-nudge
+      (or a compaction cutover) can't double-reply. Atomic mkdir lock (flock is
+      NOT on macOS, do not use it):
+        mkdir SESS/poll.lock.d 2>/dev/null || (another drain/cutover active -> stop)
+      Hold it for steps 2-4; ALWAYS rmdir it when done (even on no messages).
+   2. Read read-offset from SESS/read.offset (default 0). Read {{INBOX}}; take the
+      lines AFTER it. DRAINED = number of new lines (0 if none).
    3. For each new message line (JSON: text, message_id, optional image_path):
       a. image_path present -> Read that file first (screenshot/photo); text is the caption/instruction.
       b. else treat text as a task/question for THIS session.
       c. Process with full context, tools, memory.
       d. Reply: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "<your response>"
-      e. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/" (preferred)
-         or "!" (legacy), case-insensitive; strip the prefix before comparing:
+      e. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/"
+         (preferred) or "!" (legacy), case-insensitive; strip the prefix first:
            /status  -> reply with cwd + message count processed
-           /context -> reply with the live context gauge: read SESS/status.json and report
-                       pct, tokens, window, msgs (NON-destructive — just reports)
+           /context -> reply with the live context gauge: read SESS/status.json (written
+                       by the router) and report pct, tokens, window, msgs
            /compact -> run COMPACTION HANDOFF (below) right now
            /dir <name|path> -> resolve against ~/.telegram-bridge/dir-aliases.json
                        (case-insensitive); else literal path (~ expanded). Note the change.
            /dirs    -> reply with the alias names from ~/.telegram-bridge/dir-aliases.json
-           /end     -> Detach this session (transport teardown only): rm the registry
-                       file, closeForumTopic, delete the poll cron (id in
-                       SESS/poll.cron.id), reply "Session detached." If a
-                       bridge-preamble asked you to preserve work first (e.g. journal +
-                       checkpoint), honor that before tearing down.
-         Only those SIX are bridge commands. Any OTHER "/" text (/track, /ship, /review, ...)
-         is NOT a bridge command — treat it as a task so skills can be driven from the phone.
-         (Daemon-level /new, /whoami, /sessions, /help never reach the inbox.)
+           /end     -> FIRST run your END hook: follow the instructions in
+                       ~/.telegram-bridge/lifecycle/end.txt (ignore #-comment lines;
+                       may be empty = no extra actions). THEN deregister: rm the
+                       registry file, closeForumTopic, reply "Session detached."
+         Only those SIX are bridge commands. Any OTHER "/" text (/track, /ship,
+         /review, ...) is NOT a bridge command — treat it as a task so skills can be
+         driven from the phone. (Daemon-level /new, /whoami, /sessions, /help never
+         reach the inbox.)
    4. Write the new line count to SESS/read.offset. Release the lock: rmdir SESS/poll.lock.d.
    5. If DRAINED > 0, report briefly (e.g. "telegram: replied to 1 message").
 
-D. BACKOFF RESCHEDULE (every tick, LAST — after A/B/C; skipped only when B handed off):
-   Adaptive poll interval: fast (60s) while a conversation is active, ramping to a
-   slow cap when idle, so the session does not burn context polling an empty inbox.
-   State files in SESS:
-     idle.count   — consecutive idle ticks (no message drained)
-     poll.level   — current ladder index (0 = fastest)
-     poll.cron.id — id of THIS poll cron (written at spawn; updated here on reschedule)
-   Config (~/.telegram-bridge/compaction.json -> polling, read live):
-     idle_intervals_seconds (default [60,120,300,1800] = 1m/2m/5m/30m) — the interval ladder
-     ticks_per_rung         (default 3)                — idle ticks before advancing one rung
-   1. If section C had DRAINED >= 1 this tick: write idle.count = 0 (active — snap back to fast).
-      Else: idle.count = (current SESS/idle.count, default 0) + 1; write it.
-   2. ladder = idle_intervals_seconds; n = len(ladder).
-      target_level = min(idle.count // ticks_per_rung, n - 1).
-   3. cur_level = SESS/poll.level (default 0). If target_level == cur_level: nothing to
-      do — STOP the tick. (This is the common case: most ticks do not reschedule.)
-   4. RESCHEDULE (the level changed):
-      old_id = SESS/poll.cron.id (read it NOW, before overwriting).
-      interval = ladder[target_level] seconds.
-      cron expr: "* * * * *" if interval <= 60, else "*/<minutes> * * * *" where
-        minutes = max(1, round(interval / 60)).
-      a. Render the instantiated prompt for THIS session with the helper (it does the
-         placeholder substitution from the raw template, so no literal braces ever
-         appear in a live prompt):
-           ~/.telegram-bridge/poll-render.sh {{THREAD_ID}} {{CHAT_ID}} {{INBOX}} {{CWD}}
-         Capture its stdout — that is the prompt for the new cron.
-      b. CronCreate(cron=<expr>, prompt=<substituted>, recurring=true, durable=false).
-         Capture the NEW job id.
-      c. Write new id -> SESS/poll.cron.id ; write target_level -> SESS/poll.level.
-      d. CronDelete(old_id).  CREATE-BEFORE-DELETE: never a gap with no poller. The
-         mkdir poll.lock.d guards the one-tick overlap from double-draining.
-      e. Report: "telegram: backoff level <cur_level>->%<target_level> (<interval>s, idle <idle.count>)".
+B. COMPACTION — the ROUTER detects the context trigger, not you. When it sees your
+   gauge cross trigger_pct it delivers a reserved `/compact` (drained in A.3.e
+   above, or as a direct wake nudge). You do NOT self-check pct. Run COMPACTION
+   HANDOFF below whenever you receive /compact. (Claude Code's native auto-compact
+   remains the ultimate backstop if the router's detection is ever down.)
 
-COMPACTION HANDOFF (run from B auto-trigger or the /compact command):
+COMPACTION HANDOFF (run from the /compact command):
    You cannot shrink your own live context, so roll over to a FRESH replacement that
    restores saved state into the SAME topic. Steps, in order:
    1. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "♻️ compacting — saving context and spawning a fresh session…"
-   2. Produce a context handoff file at SESS/context-restore.md that the replacement
-      can restore from. The default install uses the gstack /context-save skill: invoke
-      it, capture the saved file path it prints, then `cp "<saved file path>"
-      SESS/context-restore.md`. If you use a different save/restore mechanism, write its
-      output to SESS/context-restore.md instead (see README "Customizing agent behavior").
+   2. Run your SAVE hook to persist context for the replacement: follow the
+      instructions in ~/.telegram-bridge/lifecycle/save.txt (ignore #-comment lines).
+      However it saves, it MUST leave the handoff at SESS/context-restore.md — that is
+      the file the replacement restores from.
    3. touch SESS/compacting.lock ; rm -f SESS/handoff-ready
    4. Spawn the replacement (attach mode). Attach intent is passed via FLAGS, not
-      env vars, so it can't be inherited by a later manual spawn and hijack a live topic:
+      env vars, so it can't be inherited by a later manual spawn and hijack a topic:
         bash ~/.telegram-bridge/telegram-spawn.sh \
           --attach {{THREAD_ID}} --restore SESS/context-restore.md "{{CWD}}"
-   5. Wait for SESS/handoff-ready to appear (the replacement writes it after restoring +
-      attaching). Poll every few seconds up to ~5 min.
-        - Not appearing in time: post "⚠️ compaction replacement didn't report ready; staying live.",
-          rm SESS/compacting.lock, and ABORT the handoff (keep running normally).
-   6. Hand off: CronDelete THIS session's poll cron (read the id from SESS/poll.cron.id),
-      then rm SESS/compacting.lock (this releases the replacement to start its poll).
-   7. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "✅ compacted — fresh session is live (was ~<pct>%)."
-   8. Retire this tmux window for easy cleanup — ONLY if this session was itself spawned by
-      the bridge (env TELEGRAM_BRIDGE_SPAWNED=1) AND $TMUX_PANE is set. Otherwise SKIP: an
-      interactive session that merely bootstrapped the bridge must never retire itself.
-      Target the window explicitly via $TMUX_PANE — a bare tmux rename-window /
-      display-message resolves to the ACTIVE window, not this one, and would clobber the
-      wrong window (e.g. the fresh replacement). Read kill_old from ~/.telegram-bridge/compaction.json:
-        - kill_old false (default): rename so you can find it later:
-            tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
-        - kill_old true: kill this window (also ends this now-handed-off session):
-            tmux kill-window -t "$TMUX_PANE"
+   5. Wait for SESS/handoff-ready to appear (the replacement writes it after restoring
+      + attaching). Poll every few seconds up to ~5 min.
+        - Not appearing in time: post "⚠️ compaction replacement didn't report ready;
+          staying live.", rm SESS/compacting.lock, and ABORT (keep running normally).
+   6. Hand off: rm SESS/compacting.lock. This releases the replacement to begin
+      draining (the router resumes pushing/backstopping it).
+   7. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "✅ compacted — fresh session is live."
+   8. Retire this tmux window for cleanup — ONLY if this session was spawned by the
+      bridge (env TELEGRAM_BRIDGE_SPAWNED=1) AND $TMUX_PANE is set. Otherwise SKIP.
+      Target the window explicitly via $TMUX_PANE (a bare rename/display resolves to
+      the ACTIVE window, not this one). Read kill_old from ~/.telegram-bridge/compaction.json:
+        - kill_old false (default): tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
+        - kill_old true:            tmux kill-window -t "$TMUX_PANE"
    9. STOP. This session has handed off; take no further action.

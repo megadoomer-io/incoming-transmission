@@ -85,13 +85,18 @@ fi
 
 # Every spawn lands as a WINDOW (a tab) in one shared "claude" tmux session, so
 # `tmux attach -t claude` shows them all as tabs — cycle with prefix + Tab. The
-# window is named for the repo so the tab is recognizable.
+# window is named "tg:<repo>" so the tab is recognizable AND visibly marked as
+# bridge-managed (distinguishing it from any manually-opened claude window in the
+# same session). The "tg:" prefix is added OUTSIDE the tr so its ":" survives the
+# charset filter; ":" is safe in a tmux window name because the code only ever
+# targets windows by index or $TMUX_PANE, never by name.
 SHARED="claude"
-win="$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
+win="tg:$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
 # The new session self-attaches: /telegram creates its own topic (named from the
-# cwd/branch) and starts its own idle poll cron. TELEGRAM_BRIDGE_SPAWNED=1 also
-# activates the Tier-2 permission hook for this session only.
+# cwd/branch) and loads the bridge procedure (no cron — the router drives timing).
+# TELEGRAM_BRIDGE_SPAWNED=1 also activates the Tier-2 permission hook for this
+# session only.
 #
 # Compaction-replacement mode: when --attach (and usually --restore) were passed,
 # this spawn is a handoff replacement for a session whose context filled. It must
@@ -100,49 +105,28 @@ win="$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 # environment, so the mode can't be inherited by accident. The /telegram skill in
 # the child still keys off TELEGRAM_BRIDGE_ATTACH_THREAD, which we inject into the
 # child env below from these flag values.
-# Optional operator-style preamble. incoming-transmission is an agnostic
-# transport: by default it injects ONLY transport-necessary facts and lets the
-# spawned session behave like normal Claude. A user who wants to layer their own
-# autonomy/style guidance onto UNATTENDED spawns drops it in
-# ~/.telegram-bridge/spawn-preamble.txt (seeded empty from spawn-preamble.example.txt
-# by the installer). We read it, strip comment/blank lines, and prepend it to the
-# prompt only when it has real content. See README "Customizing agent behavior".
-PREAMBLE_FILE="${TELEGRAM_BRIDGE_SPAWN_PREAMBLE:-$HOME/.telegram-bridge/spawn-preamble.txt}"
-preamble=""
-if [ -f "$PREAMBLE_FILE" ]; then
-    preamble="$(grep -vE '^[[:space:]]*(#|$)' "$PREAMBLE_FILE" 2>/dev/null || true)"
-fi
-
-# TRANSPORT-NECESSARY mechanism note (NOT an opinion on how to behave): a `/new`
-# spawn has no human at the TUI, so a blocking native AskUserQuestion would hang
-# the detached pane forever. Native AUQ is therefore disabled for spawns (via
-# --disallowedTools below); the optional Telegram AUQ MCP is the supported way to
-# ask the owner a question from an unattended spawn. This is the floor of what the
-# session must know to function over the transport; any style guidance is layered
-# in via the preamble above.
-spawn_mechanism="Transport note: you were spawned UNATTENDED (no human at this terminal). Native AskUserQuestion is disabled here because a blocking prompt would hang the detached pane; if the Telegram AskUserQuestion MCP is configured, use it to reach the owner, otherwise proceed without it."
+# TRANSPORT-NECESSARY mechanism note (NOT an opinion on how to behave): this
+# session has no human at THIS terminal — the owner is on Telegram. Native
+# AskUserQuestion would render a blocking picker into a pane nobody is watching,
+# so it is disabled for spawns (via --disallowedTools below); the optional Telegram
+# AUQ MCP is the supported way to ask the owner. Behavior, style, and context
+# restore are layered in via the lifecycle hooks (lifecycle/*.txt), never here.
+spawn_mechanism="Transport note: there is no human at THIS terminal — you reach the owner through Telegram. Native AskUserQuestion is disabled here (it would render a blocking picker into a pane nobody is watching); if the Telegram AskUserQuestion MCP is configured, use it to ask the owner, otherwise proceed and state your assumptions."
 
 if [ -n "$ATTACH_THREAD" ]; then
     prompt="You are a compaction replacement for a Telegram-bridged session whose context filled up. Do these IN ORDER, then wait for instructions:
-1. Restore the prior working context from the handoff file: ${RESTORE_FILE}
-2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then start the poll cron.
+1. Restore prior working context. The rollover handoff file is at ${RESTORE_FILE}. Run your START hook now: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines).
+2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then load the bridge procedure and do an initial drain (it runs no cron — the router drives timing).
 3. Continue the restored work.
 
 ${spawn_mechanism}"
 else
     prompt="You were spawned by the telegram bridge. Do these IN ORDER, then wait for instructions:
-1. Invoke the /telegram skill to attach yourself to a Telegram topic.
-2. Wait for instructions.
+1. Restore any prior context for this project. Run your START hook: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines). This is a fresh spawn with no rollover handoff file — if your hook looks for one, that's fine, just carry on.
+2. Invoke the /telegram skill to attach yourself to a Telegram topic.
+3. Wait for instructions.
 
 ${spawn_mechanism}"
-fi
-
-# Prepend the operator preamble (if any) so user style sits ahead of the
-# transport mechanics. Default install ships an empty preamble -> no change.
-if [ -n "$preamble" ]; then
-    prompt="${preamble}
-
-${prompt}"
 fi
 
 # Pre-trust the target dir so the spawned claude doesn't hang on the "Do you

@@ -8,6 +8,23 @@ transport-necessary mechanism, with all operator-style behavior moved behind a
 documented, user-amendable seam (default = normal Claude).
 
 ### Changed
+- **Smart-router / dumb-session redesign (core).** Moved polling/timing
+  intelligence from per-session poll crons into the router daemon. The router now
+  (a) **pushes** a one-line drain nudge to the session's pane the moment a message
+  arrives (primary delivery), (b) computes each session's context gauge itself on a
+  dedicated thread (`context_loop`, off the getUpdates path), and (c) detects the
+  compaction trigger and nudges the session to hand off, and (d) **backstops**
+  delivery — if a pushed message stays undrained it re-nudges, throttled to
+  `backstop_seconds` and only while the inbox is non-empty. The session is reduced to
+  a "dumb" processor that runs NO cron at all: it loads the bridge procedure at attach
+  and drains purely on the router's nudges — the adaptive backoff ladder
+  (`idle.count`/`poll.level`/`idle_intervals_seconds`/`ticks_per_rung`), the
+  session-side status gauge, and the session heartbeat cron are all gone.
+  `compaction.json` swaps the `polling` ladder for `backstop_seconds` +
+  `context_interval_seconds`. `poll-prompt.tmpl`,
+  `telegram-router.py`, the `/telegram` skill, and the README are updated together.
+  **UNTESTED end-to-end** (no live token); the wake path in particular
+  (send-keys into a busy TUI) is unverified pending the first test pass.
 - **Separated transport mechanism from operator style (C1).** Stripped the
   autonomy/style language ("make decisions yourself", "be deliberate with writes")
   and the hardcoded `/context-restore` from the `/new` spawn prompts
@@ -30,11 +47,16 @@ documented, user-amendable seam (default = normal Claude).
   `compaction.json`.
 
 ### Added
-- **Operator-style preamble seam (C1).** `spawn-preamble.example.txt` (for `/new`
-  spawns) and `bridge-preamble.example.txt` (for bridged sessions). The installer
-  seeds empty live copies (`spawn-preamble.txt` / `bridge-preamble.txt`, gitignored)
-  only if absent; `telegram-spawn.sh` / `poll-render.sh` strip comments/blanks and
-  prepend them when non-empty. Default install injects nothing → normal Claude.
+- **Configurable lifecycle hooks (C1).** Four per-event hook files in
+  `~/.telegram-bridge/lifecycle/` — `style` (reply formatting, every attach),
+  `start` (restore on a spawned/rollover birth), `save` (persist on rollover), `end`
+  (actions on `/end`). The session reads the relevant one live at each lifecycle
+  moment, so edits take effect with no re-render. `style`/`end` ship empty (default
+  = normal Claude / just detach); `start`/`save` ship a functional agnostic default
+  (rollover continuity needs save/restore), with the gstack version documented as a
+  commented example. This pulls the last hardcoded gstack-isms (`/track`,
+  `/context-save`, `/context-restore`) out of `poll-prompt.tmpl` and
+  `telegram-spawn.sh`. Replaces the earlier spawn/bridge preamble seam.
 - **Watchdog control subcommands (C2).** `telegram-bridge watchdog-start` /
   `watchdog-stop` render the watchdog plist (`__HOME__`/`__STATE_DIR__`/`__TOKEN__`)
   to `~/Library/LaunchAgents/`, `chmod 600`, and bootstrap/bootout it — mirroring
