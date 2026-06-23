@@ -17,6 +17,10 @@ a wake nudge just says "run section A" or "run the compaction handoff", so keep
 this in context. There is no backoff ladder, no idle.count, no poll.level, no
 poll cron. You are purely reactive: act when nudged, then go idle.
 
+STYLE: before you reply to anything, read ~/.telegram-bridge/lifecycle/style.txt and
+follow it for every reply this session (ignore #-comment lines; if empty, reply with
+normal formatting).
+
 A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
    1. Take a non-blocking per-topic lock so a push drain and a backstop re-nudge
       (or a compaction cutover) can't double-reply. Atomic mkdir lock (flock is
@@ -39,11 +43,11 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
            /dir <name|path> -> resolve against ~/.telegram-bridge/dir-aliases.json
                        (case-insensitive); else literal path (~ expanded). Note the change.
            /dirs    -> reply with the alias names from ~/.telegram-bridge/dir-aliases.json
-           /end     -> FIRST preserve the session's work: invoke /track (journal it),
-                       then /context-save (checkpoint so a future launch can resume).
-                       THEN deregister: rm the registry file, closeForumTopic, reply
-                       "Session detached (work tracked + checkpoint saved)." There is
-                       no cron to delete.
+           /end     -> FIRST run your END hook: follow the instructions in
+                       ~/.telegram-bridge/lifecycle/end.txt (ignore #-comment lines;
+                       may be empty = no extra actions). THEN deregister: rm the
+                       registry file, closeForumTopic, reply "Session detached."
+                       There is no cron to delete.
          Only those SIX are bridge commands. Any OTHER "/" text (/track, /ship,
          /review, ...) is NOT a bridge command — treat it as a task so skills can be
          driven from the phone. (Daemon-level /new, /whoami, /sessions, /help never
@@ -64,9 +68,10 @@ COMPACTION HANDOFF (run from the /compact command):
    You cannot shrink your own live context, so roll over to a FRESH replacement that
    restores saved state into the SAME topic. Steps, in order:
    1. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "♻️ compacting — saving context and spawning a fresh session…"
-   2. Invoke /context-save (or your configured save mechanism). It prints the saved
-      file path; capture it, then copy to a stable handoff path:
-        cp "<saved file path>" SESS/context-restore.md
+   2. Run your SAVE hook to persist context for the replacement: follow the
+      instructions in ~/.telegram-bridge/lifecycle/save.txt (ignore #-comment lines).
+      However it saves, it MUST leave the handoff at SESS/context-restore.md — that is
+      the file the replacement restores from.
    3. touch SESS/compacting.lock ; rm -f SESS/handoff-ready
    4. Spawn the replacement (attach mode). Attach intent is passed via FLAGS, not
       env vars, so it can't be inherited by a later manual spawn and hijack a topic:

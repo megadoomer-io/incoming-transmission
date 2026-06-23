@@ -243,7 +243,7 @@ phone.
 | `/status` | Show this session's cwd and processed count |
 | `/context` | Report the live context gauge (pct, tokens, window, msgs) — non-destructive |
 | `/compact` | Roll this session over to a fresh one now, preserving working state |
-| `/end` | Detach: close the topic, remove the registry (no cron to remove). (Optionally preserve work first via a `bridge-preamble.txt` that asks for journal/checkpoint — see "Customizing agent behavior" in the README) |
+| `/end` | Detach: close the topic, remove the registry (no cron to remove). Runs the `end` lifecycle hook first (e.g. journal/checkpoint) — see "Customizing agent behavior" in the README |
 | `/dir <name\|path>` | Change working dir. `<name>` is resolved against `~/.telegram-bridge/dir-aliases.json` (case-insensitive); otherwise treated as a literal path |
 | `/dirs` | List the available directory aliases |
 
@@ -322,12 +322,13 @@ session then does the *handoff*: save context → spawn a fresh replacement in t
 SAME topic (attach mode) → the replacement restores, attaches, takes over → the old
 session stops. A per-topic mkdir lock plus a `compacting.lock` / `handoff-ready`
 handshake guarantee the two never overlap and no message is dropped or
-double-answered across the cutover. The save/restore mechanism is pluggable: the
-default install uses gstack `/context-save` + `/context-restore`, but the save step
-writes a plain handoff file (`SESS/context-restore.md`) the replacement reads, so
-you can point it at your own mechanism — see "Customizing agent behavior" in the
-README. Claude Code's native auto-compact still sits underneath as the ultimate
-safety net if the router's detection is ever down.
+double-answered across the cutover. The save/restore mechanism is pluggable via the
+`save` and `start` lifecycle hooks (`~/.telegram-bridge/lifecycle/`): the save step
+must leave a handoff at `SESS/context-restore.md` and the replacement's start hook
+restores from it — default is a built-in summary, the shipped example documents the
+gstack `/context-save` + `/context-restore` version. See "Customizing agent
+behavior" in the README. Claude Code's native auto-compact still sits underneath as
+the ultimate safety net if the router's detection is ever down.
 
 **Tuning** (`~/.telegram-bridge/compaction.json`, read live — no restart):
 
@@ -392,14 +393,14 @@ also accepts a short alias from `~/.telegram-bridge/dir-aliases.json` (e.g.
 `/telegram`. The new session opens its own topic (named from cwd/branch) and
 posts there once ready.
 
-By default the spawn prompt carries ONLY transport mechanics (attach via
-`/telegram`, then wait). Any operator style — including "restore prior context on
-startup" or "journal + checkpoint on `/end`" — is opt-in via the preamble seam
-(`spawn-preamble.txt` for spawns, `bridge-preamble.txt` for bridged sessions). See
-"Customizing agent behavior" in the README. For example, a spawn-preamble that
-runs `/context-restore` first makes `/new <repo>` start already loaded with that
-project's last saved checkpoint; pairing it with a bridge-preamble that runs
-`/context-save` on `/end` lets the next `/new` pick up where the last left off.
+By default the spawn prompt carries ONLY transport mechanics (run the `start` hook,
+attach via `/telegram`, then wait). Behavior is configured through the lifecycle
+hooks in `~/.telegram-bridge/lifecycle/` — `start` (restore on a spawned/rollover
+birth), `style` (reply formatting), `save` (persist on rollover), `end` (actions on
+`/end`). See "Customizing agent behavior" in the README. For example, a `start`
+hook that runs `/context-restore` makes `/new <repo>` start already loaded with that
+project's last saved checkpoint; an `end` hook that runs `/context-save` lets the
+next `/new` pick up where the last left off.
 
 Key design points:
 

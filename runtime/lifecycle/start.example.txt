@@ -1,0 +1,15 @@
+# start hook — restore prior context when a session is BORN (spawned / rollover)
+#
+# Run by a bridge-SPAWNED session (/new or a compaction replacement) right after
+# it attaches — NOT by an interactive `/telegram` attach (that session is already
+# live; restoring would clobber it). The spawn prompt names the handoff file.
+# Lines starting with '#' or blank are ignored.
+#
+# The active line below is the agnostic default. Replace it with your own
+# save/restore mechanism if you have one.
+Read the handoff file named in the spawn prompt to recover prior working context. If there is none, carry on fresh.
+#
+# Example with the gstack skill (delete the '#' AND remove the default line above):
+#
+# Run /context-restore to load the latest saved checkpoint for this project. If it
+# reports no saved context, that's fine — carry on.

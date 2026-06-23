@@ -30,10 +30,11 @@ echo
 
 mkdir -p "$PREFIX" "$BIN_DIR" "$STATE_DIR"
 
-# 1. Runtime code + configs (everything except *.template / *.example).
-#    Note the glob excludes *.example.txt and *.example.json — the preamble and
-#    dir-alias examples are seeded to their live names below, only if absent.
+# 1. Runtime code + configs (everything except *.template / *.example and the
+#    lifecycle/ subdir, which is seeded separately below). The examples are seeded
+#    to their live names later, only if absent.
 for f in "$REPO_DIR"/runtime/*; do
+    [ -d "$f" ] && continue   # skip subdirs (lifecycle/ handled below)
     base="$(basename "$f")"
     case "$base" in
         *.template|*.example|*.example.txt|*.example.json) continue ;;
@@ -65,16 +66,18 @@ else
     echo "kept existing $PREFIX/dir-aliases.json"
 fi
 
-# 3b. Seed the operator-style preamble files from their examples, only if absent.
-#     These are the "Customizing agent behavior" seam: empty by default (the
-#     examples are all comments), so a default install behaves like normal Claude
-#     plus transport mechanics. Edit them to layer in your own style.
-for p in spawn-preamble bridge-preamble; do
-    if [ ! -f "$PREFIX/$p.txt" ]; then
-        cp "$REPO_DIR/runtime/$p.example.txt" "$PREFIX/$p.txt"
-        echo "seeded $PREFIX/$p.txt (empty by default; edit to customize behavior)"
+# 3b. Seed the lifecycle hooks from their examples, only if absent. These are the
+#     "Customizing agent behavior" seam: style/end ship empty (default = normal
+#     Claude / just detach), start/save ship a functional agnostic default. Edit
+#     them to layer in your own save/restore/journal mechanism. The session reads
+#     these live at each lifecycle moment, so changes take effect without a restart.
+mkdir -p "$PREFIX/lifecycle"
+for h in style start save end; do
+    if [ ! -f "$PREFIX/lifecycle/$h.txt" ]; then
+        cp "$REPO_DIR/runtime/lifecycle/$h.example.txt" "$PREFIX/lifecycle/$h.txt"
+        echo "seeded $PREFIX/lifecycle/$h.txt"
     else
-        echo "kept existing $PREFIX/$p.txt"
+        echo "kept existing $PREFIX/lifecycle/$h.txt"
     fi
 done
 
@@ -115,10 +118,12 @@ Done. Next steps (not automated — you stay in control):
 
 7. In any Claude Code session, run /telegram to attach it to a topic.
 
-8. (optional) Customize agent behavior. By default the bridge injects only
-   transport mechanics. To layer in your own operator style, edit:
-     $PREFIX/spawn-preamble.txt   (for unattended /new spawns)
-     $PREFIX/bridge-preamble.txt  (for bridged, human-in-the-loop sessions)
-   Both ship empty (all comments) so default behavior is normal Claude. See the
-   README "Customizing agent behavior" section.
+8. (optional) Customize agent behavior via the lifecycle hooks in
+   $PREFIX/lifecycle/ (read live by the session at each lifecycle moment):
+     style.txt  - reply formatting for every bridged session (default: empty)
+     start.txt  - restore context on a spawned/rollover birth (default: read handoff)
+     save.txt   - persist context on rollover (default: summarize to the handoff)
+     end.txt    - actions on /end before detaching (default: empty)
+   Defaults make a fresh install behave like normal Claude over the transport. Each
+   file documents a gstack example. See the README "Customizing agent behavior".
 EOF

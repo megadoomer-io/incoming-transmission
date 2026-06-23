@@ -47,11 +47,16 @@ documented, user-amendable seam (default = normal Claude).
   `compaction.json`.
 
 ### Added
-- **Operator-style preamble seam (C1).** `spawn-preamble.example.txt` (for `/new`
-  spawns) and `bridge-preamble.example.txt` (for bridged sessions). The installer
-  seeds empty live copies (`spawn-preamble.txt` / `bridge-preamble.txt`, gitignored)
-  only if absent; `telegram-spawn.sh` / `poll-render.sh` strip comments/blanks and
-  prepend them when non-empty. Default install injects nothing → normal Claude.
+- **Configurable lifecycle hooks (C1).** Four per-event hook files in
+  `~/.telegram-bridge/lifecycle/` — `style` (reply formatting, every attach),
+  `start` (restore on a spawned/rollover birth), `save` (persist on rollover), `end`
+  (actions on `/end`). The session reads the relevant one live at each lifecycle
+  moment, so edits take effect with no re-render. `style`/`end` ship empty (default
+  = normal Claude / just detach); `start`/`save` ship a functional agnostic default
+  (rollover continuity needs save/restore), with the gstack version documented as a
+  commented example. This pulls the last hardcoded gstack-isms (`/track`,
+  `/context-save`, `/context-restore`) out of `poll-prompt.tmpl` and
+  `telegram-spawn.sh`. Replaces the earlier spawn/bridge preamble seam.
 - **Watchdog control subcommands (C2).** `telegram-bridge watchdog-start` /
   `watchdog-stop` render the watchdog plist (`__HOME__`/`__STATE_DIR__`/`__TOKEN__`)
   to `~/Library/LaunchAgents/`, `chmod 600`, and bootstrap/bootout it — mirroring
