@@ -24,7 +24,15 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
    1. Take a non-blocking per-topic lock so a push drain and a backstop re-nudge
       (or a compaction cutover) can't double-reply. Atomic mkdir lock (flock is
       NOT on macOS, do not use it):
-        mkdir SESS/poll.lock.d 2>/dev/null || (another drain/cutover active -> stop)
+        mkdir SESS/poll.lock.d 2>/dev/null || (lock held -> self-heal or stop)
+      If the mkdir fails the lock is held. Self-heal a STALE lock (a drain that
+      died before releasing): if SESS/poll.lock.d is older than poll_lock_ttl_seconds
+      (~/.telegram-bridge/compaction.json, default 1800), rmdir it and retry the
+      mkdir once; otherwise a live drain owns it -> stop. The dir's own mtime is the
+      acquire time, so no owner file is needed:
+        ttl=$(jq -r '.poll_lock_ttl_seconds // 1800' ~/.telegram-bridge/compaction.json 2>/dev/null || echo 1800)
+        find SESS/poll.lock.d -maxdepth 0 -mmin +$((ttl/60)) >/dev/null 2>&1 \
+          && rmdir SESS/poll.lock.d && mkdir SESS/poll.lock.d   # reclaim only if stale
       Hold it for steps 2-4; ALWAYS rmdir it when done (even on no messages).
    2. Read read-offset from SESS/read.offset (default 0). Read {{INBOX}}; take the
       lines AFTER it. DRAINED = number of new lines (0 if none).
