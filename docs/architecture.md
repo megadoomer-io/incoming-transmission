@@ -87,9 +87,7 @@ whether or not someone is at the pane).
 
 ![Permission approval](diagrams/permission-approval.svg)
 
-<!-- Source: diagrams/permission-approval.dot — regenerate with `make diagrams`.
-     NOTE: diagram predates the rich-answer buttons (Always allow / +note /
-     +redirect) and the perm-pending/perm-answer side channel; update the .dot. -->
+<!-- Source: diagrams/permission-approval.dot — regenerate with `make diagrams` -->
 
 `telegram-permission-hook.py` is a PreToolUse hook registered in
 `~/.claude/settings.json` (**NOT** `settings.local.json` — Claude Code ignores
