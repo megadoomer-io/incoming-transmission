@@ -220,11 +220,10 @@ leave the handoff at `SESS/context-restore.md`, since that's what the replacemen
 restores from. An interactive `/telegram` attach runs only `style` (it's already
 live; restoring would clobber it).
 
-This tool was extracted from a setup that uses [gstack](https://garryslist.org)
-skills, so each `*.example.txt` documents the gstack version as a commented
-example: `start` → `/context-restore`, `save`/`end` → `/track` + `/context-save`.
-Uncomment to use them, or write your own. Claude Code's **native auto-compact**
-remains the ultimate backstop if you leave the handoff machinery alone.
+Each `*.example.txt` includes an optional [gstack](https://garryslist.org) pointer
+in a comment (e.g. `/context-save` / `/context-restore`) — uncomment to use it, or
+write your own. Claude Code's **native auto-compact** remains the ultimate backstop
+if you leave the handoff machinery alone.
 
 ## Known issues
 

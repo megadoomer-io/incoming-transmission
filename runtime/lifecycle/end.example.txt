@@ -4,7 +4,5 @@
 # removes the registry). Lines starting with '#' or blank are ignored. Empty (the
 # default) = just detach, no extra actions.
 #
-# Example with the gstack skills (delete the '#' to use, or write your own):
-#
-# Invoke /track to journal the session, then /context-save to checkpoint it so a
-# future session can resume this work.
+# If you use gstack, you may wish to /context-save here so a future session can
+# resume this work (delete the '#' to use, or write your own).

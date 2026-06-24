@@ -9,7 +9,5 @@
 # keep that requirement.
 Write a brief summary of your current working state (what you're doing, key decisions made, what's left) to SESS/context-restore.md.
 #
-# Example with the gstack skills (delete the '#' AND remove the default line above):
-#
-# Invoke /track to journal the session, then /context-save to checkpoint it; copy
-# the saved file path it prints to SESS/context-restore.md.
+# If you use gstack, you may wish to /context-save here, then copy its output to
+# SESS/context-restore.md (delete the '#' and remove the default line above to use it).
