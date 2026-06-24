@@ -22,13 +22,13 @@ The one exception is the **optional** AskUserQuestion MCP server
 sessions with `/new` and want them to ask you questions on the phone. Everything
 else — router, hooks, poll loop, watchdog — is stdlib-only.
 
-> ## ⚠️ Status: pre-release, UNTESTED
+> ## ⚠️ Status: early release
 >
-> This is a fresh extraction. The runtime is the proven code from a working
-> private setup, but the **packaged repo has not been installed or run
-> end-to-end yet**. Treat it as a preview — read it, clone it, but expect rough
-> edges if you run it before the first tested release (v0.1). **Install at your
-> own risk until then.** Known caveats are listed in [Caveats](#caveats) below.
+> The runtime is proven code in daily use, and a live deploy is byte-identical to
+> what's packaged here. What's newer is the **packaged installer (`install.sh`) and
+> the Claude Code wiring steps** — extracted recently and only lightly tested from a
+> clean clone, so expect the occasional rough edge on first setup. Known caveats are
+> listed in [Caveats](#caveats) below.
 
 ## Philosophy: transport, not workflow opinion
 
@@ -227,8 +227,8 @@ if you leave the handoff machinery alone.
 
 ## Known issues
 
-Pre-release, untested. Beyond the [Caveats](#caveats), these specific items are
-known and pending the first end-to-end test:
+Early release. Beyond the [Caveats](#caveats), these specific items are known and
+pending the first end-to-end test:
 
 - **Spawned-session default is fully autonomous.** `permissions.json` ships
   `spawned_mode: "auto-allow"`: a `/new` session runs Write/Edit/MCP and answers its
@@ -293,8 +293,9 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
 
 ## Caveats
 
-- **Untested end-to-end.** See the status banner up top. The runtime is proven;
-  the packaged install path is not yet validated.
+- **Installer lightly tested.** The runtime is proven and in daily use; the
+  packaged `install.sh` and wiring steps are newly extracted and not yet run from a
+  clean clone by a third party. See the status banner up top.
 - **macOS only (for now).** The daemon + watchdog are launchd services and the
   installer renders launchd plists. The Python runtime is portable; a Linux
   (systemd) service layer is a TODO.
