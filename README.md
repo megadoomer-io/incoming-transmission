@@ -1,6 +1,7 @@
 # incoming-transmission
 
-> *"Incoming transmission from the Tallest."*
+<img width="480" height="270" alt="Incoming transmission from... Earth?" src="https://github.com/user-attachments/assets/7975fc74-96e1-4134-b36f-543c1a874176" />
+
 
 Drive your Claude Code sessions from your phone. `incoming-transmission` attaches
 a live Claude Code session to a **Telegram forum topic** — whatever you type in
