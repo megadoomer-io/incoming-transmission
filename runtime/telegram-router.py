@@ -483,7 +483,7 @@ def update_stickies(state):
 # like status/dir — the session executes them. Names must be 1-32 chars, lowercase
 # a-z/0-9/_. Order = menu order.
 BRIDGE_COMMANDS = [
-    ("new", "Spawn a new Claude session (dir or alias optional)"),
+    ("new", "Spawn a new Claude session (dir/alias + optional intent note)"),
     ("sessions", "List attached Claude sessions"),
     ("status", "This session: cwd + messages processed"),
     ("context", "This session: live context % gauge"),
@@ -569,8 +569,9 @@ WELCOME = (
 
 HELP = (
     "Telegram bridge — commands:\n"
-    "/new [dir] — spawn a NEW Claude session in dir (default: home) and "
-    "auto-attach it to its own topic\n"
+    "/new [dir] [intent note] — spawn a NEW Claude session in dir (default: home) "
+    "and auto-attach it to its own topic; any trailing text is an optional intent "
+    "note the fresh session starts with\n"
     "/whoami  — show this chat id, your user id, and the current topic id\n"
     "/sessions — list Claude sessions attached to topics\n"
     "/help — this message\n\n"
@@ -920,15 +921,26 @@ def handle_message(msg, state):
                      thread_id=thread_id, reply_to=message_id)
         return
     if cmd == "new":
-        parts = text.split(maxsplit=1)
+        # /new <dir|alias> [intent note...] — the first whitespace-delimited token
+        # after the command is the dir/alias; everything after it is an optional
+        # free-text intent note injected into the spawn prompt so the fresh session
+        # starts knowing why it was created (issue #11). No dir -> default home, no
+        # note. A dir with spaces must be an alias: the note boundary is the first
+        # space after the dir token.
+        parts = text.split(maxsplit=2)
         target = parts[1].strip() if len(parts) > 1 else "~"
+        intent = parts[2].strip() if len(parts) > 2 else ""
         if not SPAWN_SCRIPT.exists():
             send_message(chat_id, "spawn script missing: {}".format(SPAWN_SCRIPT),
                          thread_id=thread_id, reply_to=message_id)
             return
+        spawn_args = ["/bin/bash", str(SPAWN_SCRIPT)]
+        if intent:
+            spawn_args += ["--intent", intent]
+        spawn_args.append(target)
         try:
             proc = subprocess.run(
-                ["/bin/bash", str(SPAWN_SCRIPT), target],
+                spawn_args,
                 capture_output=True, text=True, timeout=30, env=dict(os.environ))
         except Exception as e:
             send_message(chat_id, "spawn failed: {}".format(e),
@@ -936,15 +948,16 @@ def handle_message(msg, state):
             log("new: spawn {} raised {}".format(target, e))
             return
         if proc.returncode == 0:
+            note = "\nIntent: {}".format(intent) if intent else ""
             send_message(chat_id,
-                         "Spawning a session in {} ...\nIt will open its own topic "
-                         "and post there once attached.".format(target),
+                         "Spawning a session in {} ...{}\nIt will open its own topic "
+                         "and post there once attached.".format(target, note),
                          thread_id=thread_id, reply_to=message_id)
         else:
             err = (proc.stderr or proc.stdout or "unknown error").strip()
             send_message(chat_id, "spawn failed: {}".format(err),
                          thread_id=thread_id, reply_to=message_id)
-        log("new: spawn {} rc={}".format(target, proc.returncode))
+        log("new: spawn {} intent={!r} rc={}".format(target, intent, proc.returncode))
         return
 
     # --- route to the session that owns this topic ---

@@ -106,7 +106,8 @@ compaction handoff (PAK transfer), and the Tier-2 permission round-trip.
   + handshake so no message is dropped or double-answered. *(Requires a
   save/restore mechanism — see [Customizing agent behavior](#customizing-agent-behavior).)*
 - **Spawn from your phone** — `/new <dir>` launches a fresh attached session as a
-  tmux tab.
+  tmux tab. Add a free-text intent note (`/new <dir> <why you started it>`) and the
+  fresh session starts already knowing the goal.
 - **Unattended permissions (Tier 2)** — optional tap-to-approve: with
   `spawned_mode: "ask"`, spawned sessions route Write/Edit/MCP approvals to the
   topic as buttons. **The shipped default is `auto-allow` (fully autonomous, no
@@ -181,7 +182,7 @@ Typed in the control group (handled by the Massive):
 
 | Command | Action |
 |---------|--------|
-| `/new [dir]` | deploy a new Invader (spawn a session) attached to its own topic |
+| `/new [dir] [intent note]` | deploy a new Invader (spawn a session) attached to its own topic; trailing text is an optional intent note the session starts with |
 | `/whoami` | chat_id, your user_id, current topic |
 | `/sessions` | list attached sessions |
 

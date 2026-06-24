@@ -18,8 +18,12 @@
 # during profile load (nobody is at the pane to type it) and emit asdf path
 # noise. claude is a standalone cask binary, so it needs no profile.
 #
-# Usage: telegram-spawn.sh [--attach <thread> --restore <file>] <target_dir>
+# Usage: telegram-spawn.sh [--attach <thread> --restore <file>] [--intent <note>] <target_dir>
 #   plain <dir>            -> open a fresh topic (normal /new)
+#   --intent <note>        -> free-text operator intent (from `/new <dir> <note>`),
+#                             injected into the spawn prompt as a clearly-delimited
+#                             block so the fresh session knows why it was created,
+#                             and exported as TELEGRAM_BRIDGE_INTENT for hooks.
 #   --attach/--restore     -> compaction handoff: reattach to an existing topic.
 #                             Attach mode is flag-only (never read from the env)
 #                             so it can't be inherited and hijack a live topic.
@@ -39,11 +43,13 @@ AUQ_MCP_CONFIG="${TELEGRAM_BRIDGE_AUQ_MCP_CONFIG:-$HOME/.telegram-bridge/telegra
 unset TELEGRAM_BRIDGE_ATTACH_THREAD TELEGRAM_BRIDGE_RESTORE_FILE
 ATTACH_THREAD=""
 RESTORE_FILE=""
+INTENT=""
 raw_dir=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --attach)  ATTACH_THREAD="${2:?--attach needs a thread id}"; shift 2 ;;
         --restore) RESTORE_FILE="${2:?--restore needs a file path}"; shift 2 ;;
+        --intent)  INTENT="${2?--intent needs a note}"; shift 2 ;;
         --)        shift; raw_dir="${1:-}"; break ;;
         *)         raw_dir="$1"; shift ;;
     esac
@@ -113,6 +119,20 @@ win="tg:$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 # restore are layered in via the lifecycle hooks (lifecycle/*.txt), never here.
 spawn_mechanism="Transport note: there is no human at THIS terminal — you reach the owner through Telegram. Native AskUserQuestion is disabled here (it would render a blocking picker into a pane nobody is watching); if the Telegram AskUserQuestion MCP is configured, use it to ask the owner, otherwise proceed and state your assumptions."
 
+# Operator intent (issue #11): the owner's free-text "why I started this" note,
+# passed via --intent from `/new <dir> <note>`. Injected as a clearly-delimited
+# block kept distinct from transport mechanics — it's the OWNER's words, not a
+# behavioral opinion baked in by the bridge. Empty note -> no block, classic
+# behavior. Only meaningful for a fresh spawn (a compaction handoff restores its
+# own context), so it's woven into the else branch below.
+operator_intent=""
+if [ -n "$INTENT" ]; then
+    operator_intent="Operator intent (the owner's words at spawn time — what this session is for):
+${INTENT}
+
+"
+fi
+
 if [ -n "$ATTACH_THREAD" ]; then
     prompt="You are a compaction replacement for a Telegram-bridged session whose context filled up. Do these IN ORDER, then wait for instructions:
 1. Restore prior working context. The rollover handoff file is at ${RESTORE_FILE}. Run your START hook now: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines).
@@ -121,12 +141,17 @@ if [ -n "$ATTACH_THREAD" ]; then
 
 ${spawn_mechanism}"
 else
+    if [ -n "$INTENT" ]; then
+        step3="Echo the operator intent below in your attach message so the owner sees their note reflected back, then begin working toward it (ask via the Telegram AskUserQuestion MCP if it needs clarifying)."
+    else
+        step3="Wait for instructions."
+    fi
     prompt="You were spawned by the telegram bridge. Do these IN ORDER, then wait for instructions:
 1. Restore any prior context for this project. Run your START hook: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines). This is a fresh spawn with no rollover handoff file — if your hook looks for one, that's fine, just carry on.
 2. Invoke the /telegram skill to attach yourself to a Telegram topic.
-3. Wait for instructions.
+3. ${step3}
 
-${spawn_mechanism}"
+${operator_intent}${spawn_mechanism}"
 fi
 
 # Pre-trust the target dir so the spawned claude doesn't hang on the "Do you
@@ -201,6 +226,13 @@ if [ -n "$ATTACH_THREAD" ]; then
 fi
 if [ -n "$RESTORE_FILE" ]; then
     ENV_ARGS+=(-e "TELEGRAM_BRIDGE_RESTORE_FILE=$RESTORE_FILE")
+fi
+
+# Operator intent pass-through (issue #11): expose the note to lifecycle hooks
+# (e.g. start.txt) so a restore hook can fold it into the resumed context. The
+# spawn prompt already surfaces it verbally; this makes it available to scripts.
+if [ -n "$INTENT" ]; then
+    ENV_ARGS+=(-e "TELEGRAM_BRIDGE_INTENT=$INTENT")
 fi
 
 # Claude launch flags, shared by both tmux branches below.

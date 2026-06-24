@@ -378,7 +378,7 @@ generic Claude selection menu (`❯ 1.` choice line plus the `Esc to cancel` foo
 
 | Command | Action |
 |---------|--------|
-| `/new [dir]` | Spawn a NEW Claude session in `dir` (default: home), auto-attached to its own topic |
+| `/new [dir] [intent note]` | Spawn a NEW Claude session in `dir` (default: home), auto-attached to its own topic. Any text after the dir/alias is an optional free-text intent note injected into the spawn prompt |
 | `/whoami` | Report chat_id, your user_id, current topic id |
 | `/sessions` | List attached sessions/topics |
 | `/help` | Daemon help |
@@ -393,10 +393,29 @@ also accepts a short alias from `~/.telegram-bridge/dir-aliases.json` (e.g.
 `/telegram`. The new session opens its own topic (named from cwd/branch) and
 posts there once ready.
 
-By default the spawn prompt carries ONLY transport mechanics (run the `start` hook,
-attach via `/telegram`, then wait). Behavior is configured through the lifecycle
-hooks in `~/.telegram-bridge/lifecycle/` — `start` (restore on a spawned/rollover
-birth), `style` (reply formatting), `save` (persist on rollover), `end` (actions on
+**Intent note.** Anything after the dir/alias is an optional free-text intent
+note — a breadcrumb of *why* you started the session, so you (and the agent)
+aren't reconstructing the goal later:
+
+```
+/new incoming-transmission add diagrams like the other repos have
+/new kdrift investigate the stale-cache bug from yesterday
+```
+
+The first whitespace-delimited token is the dir/alias; everything after it is the
+note (a dir with spaces must therefore be an alias). The daemon passes it to
+`telegram-spawn.sh --intent <note>`, which injects it into the spawn prompt as a
+clearly-delimited "operator intent" block — kept distinct from transport
+mechanics, since it's *your* words, not a behavioral opinion the bridge bakes in.
+The fresh session echoes the note in its attach message and starts working toward
+it. The note is also exported as `TELEGRAM_BRIDGE_INTENT`, so a `start` hook can
+fold it into the resumed context. Omit it for the classic transport-only spawn.
+
+By default the spawn prompt carries ONLY transport mechanics plus any intent note
+(run the `start` hook, attach via `/telegram`, then act on the note or wait).
+Behavior is configured through the lifecycle hooks in
+`~/.telegram-bridge/lifecycle/` — `start` (restore on a spawned/rollover birth),
+`style` (reply formatting), `save` (persist on rollover), `end` (actions on
 `/end`). See "Customizing agent behavior" in the README. For example, a `start`
 hook that runs `/context-restore` makes `/new <repo>` start already loaded with that
 project's last saved checkpoint; an `end` hook that runs `/context-save` lets the
