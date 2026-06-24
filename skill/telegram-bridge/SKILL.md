@@ -517,6 +517,15 @@ blocks, the session is busy so a drain nudge won't contend.
   session). A manually-attached session in a plain terminal still saves, spawns the
   replacement, and hands off, but the old terminal session is left for you to `/end`
   or close yourself.
+- **AskUserQuestion answer shape**: a spawned session asks via the
+  `mcp__telegram__AskUserQuestion` MCP tool (native AskUserQuestion is disabled in
+  spawns). Single-select returns the chosen label (`str`); **multi-select returns
+  `list[str]`** — button taps give the chosen labels, a typed reply collapses to a
+  one-element list. Need discrete picks? Tell the owner to **tap the buttons, not
+  type**. The MCP server is **pinned at session start**, so edits to
+  `telegram-auq-mcp.py` aren't seen until the session restarts (`/compact` or a fresh
+  `/new`). It only fires under `spawned_mode: "ask"` (or with the tool allowlisted);
+  `auto-allow` denies it so the model self-decides.
 
 ## Daemon control
 
