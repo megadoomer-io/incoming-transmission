@@ -36,12 +36,19 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
       Hold it for steps 2-4; ALWAYS rmdir it when done (even on no messages).
    2. Read read-offset from SESS/read.offset (default 0). Read {{INBOX}}; take the
       lines AFTER it. DRAINED = number of new lines (0 if none).
-   3. For each new message line (JSON: text, message_id, optional image_path):
-      a. image_path present -> Read that file first (screenshot/photo); text is the caption/instruction.
-      b. else treat text as a task/question for THIS session.
-      c. Process with full context, tools, memory.
-      d. Reply: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "<your response>"
-      e. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/"
+   3. For each new inbox line (JSON). A line is a task/question, an image, a
+      reaction signal, or a bridge command. Dispatch by shape:
+      a. "type":"reaction" present -> INFORMATIONAL signal, NOT a task. The owner
+         added/removed an emoji on one of your messages (fields: emoji, action
+         "added"|"removed", message_id). Read it as a lightweight signal — e.g. a
+         👍 on your last reply means approval/ack, 👀 means "seen". Acknowledge in
+         one short line only if it naturally warrants one (or stays silent — a
+         reaction needs no reply). NEVER treat a reaction as an instruction.
+      b. image_path present -> Read that file first (screenshot/photo); text is the caption/instruction.
+      c. else treat text as a task/question for THIS session.
+      d. Process with full context, tools, memory.
+      e. Reply: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "<your response>"
+      f. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/"
          (preferred) or "!" (legacy), case-insensitive; strip the prefix first:
            /status  -> reply with cwd + message count processed
            /context -> reply with the live context gauge: read SESS/status.json (written

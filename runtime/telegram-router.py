@@ -47,6 +47,13 @@ REGISTRY_DIR = STATE_DIR / "registry"
 # Per-topic pinned-status ("sticky") bookkeeping, owned exclusively by this
 # daemon so it never races the /telegram skill's registry writes.
 STICKY_DIR = STATE_DIR / "sticky"
+# message_id -> topic index. A message_reaction update carries no
+# message_thread_id, so to route a reaction back to its session we look the
+# reacted message_id up here. Append-only JSONL written by BOTH this router
+# (incoming messages + its own sends) and telegram-send.sh (session replies),
+# read on demand when a reaction arrives. Bounded by MSG_INDEX_MAX_LINES.
+MSG_INDEX = STATE_DIR / "msg-index.jsonl"
+MSG_INDEX_MAX_LINES = 5000
 INBOX_ROOT = Path("/tmp/claude-telegram/sessions")
 BRIDGE_DIR = Path.home() / ".telegram-bridge"
 SPAWN_SCRIPT = BRIDGE_DIR / "telegram-spawn.sh"
@@ -163,6 +170,77 @@ def load_registry(tkey):
     return None
 
 
+# --- message_id -> topic index (for routing reactions) ---------------------
+
+def record_msg_thread(message_id, tkey):
+    """Remember which topic a message_id belongs to so a later reaction on it
+    can be routed (reaction updates carry no message_thread_id). Best-effort:
+    append a line, swallow errors, trim when the file grows past the cap."""
+    if message_id is None or tkey is None:
+        return
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with MSG_INDEX.open("a") as fh:
+            fh.write(json.dumps({"message_id": int(message_id),
+                                 "thread": str(tkey)}) + "\n")
+        _maybe_trim_msg_index()
+    except (OSError, ValueError) as e:
+        log("WARN record_msg_thread: {}".format(e))
+
+
+def _maybe_trim_msg_index():
+    """Keep the index bounded: when it exceeds the cap, rewrite with the most
+    recent MSG_INDEX_MAX_LINES lines (recent ids are the ones reactions hit)."""
+    try:
+        if not MSG_INDEX.is_file():
+            return
+        with MSG_INDEX.open() as fh:
+            lines = fh.readlines()
+        if len(lines) <= MSG_INDEX_MAX_LINES:
+            return
+        tmp = MSG_INDEX.with_suffix(".jsonl.tmp")
+        tmp.write_text("".join(lines[-MSG_INDEX_MAX_LINES:]))
+        tmp.replace(MSG_INDEX)
+    except OSError as e:
+        log("WARN trim msg-index: {}".format(e))
+
+
+def lookup_msg_thread(message_id):
+    """Resolve a reacted message_id back to its topic key. Last write wins.
+    Returns the topic key string, or None if the id isn't in the index."""
+    if message_id is None or not MSG_INDEX.is_file():
+        return None
+    found = None
+    try:
+        with MSG_INDEX.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("message_id") == message_id:
+                    found = rec.get("thread")
+    except OSError as e:
+        log("WARN lookup_msg_thread: {}".format(e))
+    return found
+
+
+def _emoji_set(reactions):
+    """Flatten a Telegram ReactionType list to a set of display strings:
+    standard emoji as their unicode char, custom emoji as 'custom:<id>'."""
+    out = set()
+    for r in reactions or []:
+        rtype = r.get("type")
+        if rtype == "emoji" and r.get("emoji"):
+            out.add(r["emoji"])
+        elif rtype == "custom_emoji" and r.get("custom_emoji_id"):
+            out.add("custom:{}".format(r["custom_emoji_id"]))
+    return out
+
+
 # --- telegram api ----------------------------------------------------------
 
 def api_call(method, params=None, timeout=SOCKET_TIMEOUT):
@@ -187,6 +265,10 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
         except (urllib.error.URLError, OSError) as e:
             log("ERROR sendMessage: {}".format(e))
             return None
+        # Index this sent message so a reaction on it routes back here.
+        mid = (last or {}).get("result", {}).get("message_id")
+        tk = "general" if thread_id in (None, "general") else str(thread_id)
+        record_msg_thread(mid, tk)
     return last
 
 
@@ -900,10 +982,68 @@ def handle_message(msg, state):
     with inbox.open("a") as fh:
         fh.write(json.dumps(record) + "\n")
     react_eyes(chat_id, message_id)
+    # Remember this message_id's topic so a later reaction on it can be routed.
+    record_msg_thread(message_id, tkey)
     log("routed msg {} -> topic {} ({}{})".format(
         message_id, tkey, reg.get("cwd"), " +image" if image_path else ""))
     # Best-effort: nudge a backed-off session to poll now. Delivery is already
     # done above, so this can only ever help, never drop or delay the message.
+    wake_session(reg)
+
+
+def handle_reaction(mr, state):
+    """A message_reaction update: the owner added/removed an emoji reaction.
+
+    Telegram doesn't include the topic in the update, so map the reacted
+    message_id back to its topic via the msg index, then drop an informational
+    `reaction` record into that session's inbox. A reaction is never a
+    task/instruction — the session reads it as a signal only.
+    """
+    chat = mr.get("chat", {}) or {}
+    frm = mr.get("user", {}) or {}
+    chat_id = chat.get("id")
+    from_id = frm.get("id")
+    message_id = mr.get("message_id")
+
+    # Owner + chat lock, same as handle_message. Per-user reactions carry `user`;
+    # anonymous ones come as message_reaction_count (we don't subscribe) so a
+    # missing user means we can't attribute it -> drop. The bot's own 👀
+    # auto-reaction is attributed to the bot (not the owner) and is dropped here.
+    if from_id is None or chat_id is None:
+        return
+    if state.get("allowed_user_id") is not None and from_id != state["allowed_user_id"]:
+        return
+    if state.get("chat_id") is not None and chat_id != state["chat_id"]:
+        return
+
+    added = _emoji_set(mr.get("new_reaction")) - _emoji_set(mr.get("old_reaction"))
+    removed = _emoji_set(mr.get("old_reaction")) - _emoji_set(mr.get("new_reaction"))
+    if not added and not removed:
+        return
+
+    tkey = lookup_msg_thread(message_id)
+    if tkey is None:
+        log("reaction on msg {} but no topic mapping; dropping".format(message_id))
+        return
+    reg = load_registry(tkey)
+    if reg is None or not reg.get("inbox_path"):
+        log("reaction on msg {} -> topic {} has no attached session".format(message_id, tkey))
+        return
+
+    inbox = Path(reg["inbox_path"])
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    with inbox.open("a") as fh:
+        for emoji in sorted(added):
+            fh.write(json.dumps({"ts": now_iso(), "type": "reaction",
+                                 "message_id": message_id, "emoji": emoji,
+                                 "action": "added", "from": from_id}) + "\n")
+        for emoji in sorted(removed):
+            fh.write(json.dumps({"ts": now_iso(), "type": "reaction",
+                                 "message_id": message_id, "emoji": emoji,
+                                 "action": "removed", "from": from_id}) + "\n")
+    log("routed reaction (added={} removed={}) on msg {} -> topic {}".format(
+        sorted(added), sorted(removed), message_id, tkey))
+    # Surface it promptly: nudge the session to drain. Best-effort, like messages.
     wake_session(reg)
 
 
@@ -1029,7 +1169,8 @@ def main():
             resp = api_call("getUpdates", {
                 "offset": state["offset"],
                 "timeout": LONG_POLL_SECONDS,
-                "allowed_updates": json.dumps(["message", "callback_query"]),
+                "allowed_updates": json.dumps(
+                    ["message", "callback_query", "message_reaction"]),
             })
             net_failures = 0
         except (urllib.error.URLError, OSError, ValueError) as e:
@@ -1052,11 +1193,14 @@ def main():
             state["offset"] = upd["update_id"] + 1
             msg = upd.get("message")
             cq = upd.get("callback_query")
+            mr = upd.get("message_reaction")
             try:
                 if msg:
                     handle_message(msg, state)
                 elif cq:
                     handle_callback(cq, state)
+                elif mr:
+                    handle_reaction(mr, state)
             except Exception as e:  # never let one bad update kill the daemon
                 log("ERROR handling update {}: {}".format(upd.get("update_id"), e))
         if updates:

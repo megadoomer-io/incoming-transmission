@@ -16,9 +16,12 @@ thread_id="${2:?usage: telegram-send.sh <chat_id> <thread_id|-> <text>}"
 text="${3:?usage: telegram-send.sh <chat_id> <thread_id|-> <text>}"
 
 api="https://api.telegram.org/bot${TELEGRAM_BRIDGE_BOT_TOKEN}/sendMessage"
+# Same message_id -> topic index the router reads to route emoji reactions back
+# to the right session (a message_reaction update carries no thread id).
+state_dir="${TELEGRAM_BRIDGE_STATE_DIR:-$HOME/.local/state/telegram-bridge}"
 
 # Chunk into <=4000-char pieces and POST each as JSON (json.dumps handles escaping).
-TG_CHAT="$chat_id" TG_THREAD="$thread_id" TG_API="$api" \
+TG_CHAT="$chat_id" TG_THREAD="$thread_id" TG_API="$api" TG_STATE_DIR="$state_dir" \
 python3 - "$text" <<'PY'
 import json, os, sys, urllib.request, urllib.error
 
@@ -26,6 +29,23 @@ text = sys.argv[1]
 chat = os.environ["TG_CHAT"]
 thread = os.environ["TG_THREAD"]
 api = os.environ["TG_API"]
+state_dir = os.environ["TG_STATE_DIR"]
+tkey = "general" if thread in ("-", "general", "") else str(int(thread))
+index_path = os.path.join(state_dir, "msg-index.jsonl")
+
+
+def record_sent(message_id):
+    """Best-effort: index this sent message's id -> topic so a reaction on it
+    routes back to this session. Never fail the send over an index write."""
+    if message_id is None:
+        return
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(index_path, "a") as fh:
+            fh.write(json.dumps({"message_id": int(message_id), "thread": tkey}) + "\n")
+    except (OSError, ValueError):
+        pass
+
 
 chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
 for chunk in chunks:
@@ -41,6 +61,7 @@ for chunk in chunks:
         if not resp.get("ok"):
             print("telegram-send: API error: {}".format(resp), file=sys.stderr)
             sys.exit(1)
+        record_sent(resp.get("result", {}).get("message_id"))
     except urllib.error.URLError as e:
         print("telegram-send: request failed: {}".format(e), file=sys.stderr)
         sys.exit(1)
