@@ -33,6 +33,12 @@ TMUX_BIN="${TELEGRAM_BRIDGE_TMUX:-/opt/homebrew/bin/tmux}"
 CLAUDE_BIN="${TELEGRAM_BRIDGE_CLAUDE:-/opt/homebrew/bin/claude}"
 ALIAS_FILE="${TELEGRAM_BRIDGE_DIR_ALIASES:-$HOME/.telegram-bridge/dir-aliases.json}"
 AUQ_MCP_CONFIG="${TELEGRAM_BRIDGE_AUQ_MCP_CONFIG:-$HOME/.telegram-bridge/telegram-auq-mcp.json}"
+# Persisted "always allow" rules live in ~/.telegram-bridge/spawned-allow.json and
+# are read LIVE by the Tier-2 permission hook itself — deliberately NOT passed via
+# --settings. Empirically, `claude --settings <file>` REPLACES the user's settings
+# (it does not merge the hooks key), so it silently drops settings.local.json's
+# PreToolUse hook — i.e. it disables the very gate we depend on. So the hook owns
+# enforcement of those rules; the file stays auditable native-settings JSON.
 
 # Attach (compaction-replacement) mode is requested EXPLICITLY via flags, never
 # inherited from the environment. A session spawned for compaction exports
@@ -101,8 +107,10 @@ win="tg:$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
 # The new session self-attaches: /telegram creates its own topic (named from the
 # cwd/branch) and loads the bridge procedure (no cron — the router drives timing).
-# TELEGRAM_BRIDGE_SPAWNED=1 also activates the Tier-2 permission hook for this
-# session only.
+# TELEGRAM_BRIDGE_SPAWNED=1 marks this as a /new spawn. NOTE: it is NOT what
+# activates the Tier-2 permission hook -- that hook gates EVERY bridge session by
+# topic-membership (so /new spawns and /telegram-attached sessions behave
+# identically). The var is kept only as a launch-path marker for other consumers.
 #
 # Compaction-replacement mode: when --attach (and usually --restore) were passed,
 # this spawn is a handoff replacement for a session whose context filled. It must
@@ -157,15 +165,15 @@ fi
 # Pre-trust the target dir so the spawned claude doesn't hang on the "Do you
 # trust the files in this folder?" dialog (nobody is at the detached pane to
 # answer). This sets ONLY the per-folder trust flag in ~/.claude.json.
-# NOTE: spawned sessions launch with --dangerously-skip-permissions (below) so
-# unattended tool calls never block on the native permission prompt. A hook
-# returning permissionDecision="allow" does NOT suppress that prompt in Claude
-# Code 2.1.170 (only "deny" is honored), so the engine-level flag is the only
-# reliable way to keep an unattended session flowing. Native AskUserQuestion is
-# disabled for spawns (--disallowedTools below) because a blocking prompt has no
-# one to answer it in a detached pane; the optional Telegram AUQ MCP is the
-# supported channel for asking the owner instead. Best-effort: a failure here
-# just means the dialog may appear (it won't break the spawn). Atomic via tmp+rename.
+# NOTE: spawned sessions launch with --permission-mode dontAsk (below): a tool the
+# Tier-2 permission hook doesn't explicitly allow is auto-DENIED rather than
+# prompting, so an unattended session can never hang on a native permission prompt
+# (verified in CC 2.1.178: a hook "allow" suppresses the prompt and runs the tool,
+# a hook "deny" blocks it and overrides even a broad allow rule like Bash(*)).
+# Native AskUserQuestion is disabled for spawns (--disallowedTools below) because a
+# blocking picker has no one to answer it in a detached pane; the Telegram AUQ MCP
+# is the supported channel for asking the owner. Best-effort: a failure here just
+# means the dialog may appear (it won't break the spawn). Atomic via tmp+rename.
 /usr/bin/python3 - "$dir" <<'PY' 2>/dev/null || true
 import json, os, sys, tempfile, pathlib
 cfg = pathlib.Path.home() / ".claude.json"
@@ -206,51 +214,55 @@ case ":$USER_PATH:" in
     *) USER_PATH="$FALLBACK_PATH" ;;     # capture failed/garbled — fall back
 esac
 
-# Shared env injected into the spawned claude (the daemon's launchd env is minimal).
-# NOTE: PATH is deliberately NOT here. tmux silently ignores `new-window -e PATH=`
-# (arbitrary vars work, but the child always inherits PATH from the tmux server's
-# global environment, which the launchd daemon started minimal). So PATH is forced
-# via a `/usr/bin/env PATH=...` wrapper on the launched command below instead. Get
-# this wrong and the spawned claude's hooks (claude-mem, etc.) fail with
-# `node: command not found` because /opt/homebrew/bin isn't on PATH.
-ENV_ARGS=(
-    -e "TELEGRAM_BRIDGE_BOT_TOKEN=$TELEGRAM_BRIDGE_BOT_TOKEN"
-    -e "TELEGRAM_BRIDGE_SPAWNED=1"
-    -e "HOME=$HOME"
+# Env injected into the spawned claude, passed via a `/usr/bin/env KEY=VAL ...`
+# wrapper on the launched command (below) rather than tmux `-e`.
+# WHY NOT tmux `-e`: `new-session -e VAR=val` sets the variable in the tmux SESSION
+# environment, which every window opened in that session later inherits — so
+# TELEGRAM_BRIDGE_SPAWNED=1 (and the bot token!) leaked into the user's own attended
+# windows, making the permission hook gate sessions it should not. The env wrapper
+# scopes these to THIS claude process only. (PATH must be here regardless: tmux
+# silently ignores `-e PATH=`, and the launchd daemon's PATH is minimal, so without
+# it the spawned claude's hooks fail with `node: command not found`.)
+ENV_WRAP=(
+    "PATH=$USER_PATH"
+    "TELEGRAM_BRIDGE_BOT_TOKEN=$TELEGRAM_BRIDGE_BOT_TOKEN"
+    "TELEGRAM_BRIDGE_SPAWNED=1"
+    "HOME=$HOME"
 )
 
 # Compaction-replacement env: the spawned /telegram skill reads these to take its
 # existing-topic attach path instead of creating a fresh topic.
 if [ -n "$ATTACH_THREAD" ]; then
-    ENV_ARGS+=(-e "TELEGRAM_BRIDGE_ATTACH_THREAD=$ATTACH_THREAD")
+    ENV_WRAP+=("TELEGRAM_BRIDGE_ATTACH_THREAD=$ATTACH_THREAD")
 fi
 if [ -n "$RESTORE_FILE" ]; then
-    ENV_ARGS+=(-e "TELEGRAM_BRIDGE_RESTORE_FILE=$RESTORE_FILE")
+    ENV_WRAP+=("TELEGRAM_BRIDGE_RESTORE_FILE=$RESTORE_FILE")
 fi
 
 # Operator intent pass-through (issue #11): expose the note to lifecycle hooks
 # (e.g. start.txt) so a restore hook can fold it into the resumed context. The
 # spawn prompt already surfaces it verbally; this makes it available to scripts.
 if [ -n "$INTENT" ]; then
-    ENV_ARGS+=(-e "TELEGRAM_BRIDGE_INTENT=$INTENT")
+    ENV_WRAP+=("TELEGRAM_BRIDGE_INTENT=$INTENT")
 fi
 
 # Claude launch flags, shared by both tmux branches below.
-#   --*-skip-permissions : an unattended spawn must not block on the native
-#                          permission prompt (no human at the pane to answer it).
+#   --permission-mode dontAsk : an unattended spawn must never block on a native
+#                          permission prompt. In dontAsk, a tool the Tier-2 hook
+#                          doesn't explicitly allow is auto-DENIED (not prompted),
+#                          so the pane can't wedge; the hook routes the dangerous
+#                          set to the owner over Telegram and floors the rest.
 #   --disallowedTools AskUserQuestion : native AUQ would render a blocking picker
 #                          into the detached pane; disable it.
 #   --mcp-config <auq>   : wire in the optional Telegram AUQ MCP so the session
 #                          can still ask the owner via phone buttons (the
 #                          supported substitute for the disabled native AUQ).
-#                          Added ONLY if the rendered config exists — the MCP is
-#                          optional (needs uv + the mcp package). Absent config =
-#                          skip it: the spawn still works, the session just can't
-#                          ask questions. Without this flag a spawn had native AUQ
-#                          disabled AND no replacement, so it could not ask at all.
+#                          Added ONLY if the rendered config exists.
+# NOTE: we do NOT pass --settings — it would replace the user's settings and drop
+# the PreToolUse permission hook (see SPAWN_SETTINGS note above). The hook reads
+# the persisted-allow file directly instead.
 CLAUDE_FLAGS=(
-    --allow-dangerously-skip-permissions
-    --dangerously-skip-permissions
+    --permission-mode dontAsk
     --disallowedTools AskUserQuestion
 )
 if [ -f "$AUQ_MCP_CONFIG" ]; then
@@ -262,11 +274,11 @@ if "$TMUX_BIN" has-session -t "=$SHARED" 2>/dev/null; then
     # free window index". A bare "-t $SHARED" makes new-window target index 0,
     # which fails ("create window failed: index 0 in use") once the session
     # already has a window 0 (base-index is 0).
-    "$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" "${ENV_ARGS[@]}" \
-        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
+    "$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" \
+        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
 else
-    "$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" "${ENV_ARGS[@]}" \
-        /usr/bin/env "PATH=$USER_PATH" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
+    "$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" \
+        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
 fi
 
 echo "telegram-spawn: launched window '$win' in session $SHARED (dir: $dir)"

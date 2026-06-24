@@ -72,9 +72,21 @@ fi
 #     chose (e.g. "ask") — like dir-aliases, this is local config we preserve.
 if [ ! -f "$PREFIX/permissions.json" ]; then
     cp "$REPO_DIR/runtime/permissions.json" "$PREFIX/permissions.json"
-    echo "seeded $PREFIX/permissions.json (spawned_mode: auto-allow)"
+    echo "seeded $PREFIX/permissions.json (spawned_mode: risk-tiered)"
 else
     echo "kept existing $PREFIX/permissions.json"
+fi
+
+# 3a-ii. Seed the bridge-scoped settings file that holds persisted "always allow"
+#        rules. Starts empty; the Tier-2 permission hook appends narrow allow-rules
+#        to it when the owner taps "Always allow". The spawn loads it via --settings
+#        so the engine enforces those rules. Preserved across re-installs (it is
+#        accumulated, auditable state — like dir-aliases and permissions.json).
+if [ ! -f "$PREFIX/spawned-allow.json" ]; then
+    printf '{\n  "permissions": {\n    "allow": []\n  }\n}\n' > "$PREFIX/spawned-allow.json"
+    echo "seeded $PREFIX/spawned-allow.json (persisted always-allow rules; starts empty)"
+else
+    echo "kept existing $PREFIX/spawned-allow.json"
 fi
 
 # 3b. Seed the lifecycle hooks from their examples, only if absent. These are the
@@ -120,7 +132,11 @@ Done. Next steps (not automated — you stay in control):
 
 5. Wire Claude Code (per the README "Claude Code wiring" section):
    - SessionStart hook -> $PREFIX/telegram-self-register.py
-   - (optional) Tier-2 permission hook for unattended spawns
+   - Tier-2 permission hook -> $PREFIX/telegram-permission-hook.py as a PreToolUse
+     hook in ~/.claude/settings.json (NOT settings.local.json -- Claude Code ignores
+     .local hooks in spawned sessions). Matcher "Write|Edit|NotebookEdit|Bash|mcp__.*",
+     timeout 1800. Gates dangerous tool calls in every bridge session (tap-to-approve
+     on your phone); see the README "Claude Code wiring" snippet.
    - (optional) AskUserQuestion MCP from $PREFIX/telegram-auq-mcp.json
 
 6. (optional) Start the wedge watchdog (renders its plist + loads it, like the
