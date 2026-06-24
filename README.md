@@ -108,12 +108,13 @@ compaction handoff (PAK transfer), and the Tier-2 permission round-trip.
 - **Spawn from your phone** — `/new <dir>` launches a fresh attached session as a
   tmux tab. Add a free-text intent note (`/new <dir> <why you started it>`) and the
   fresh session starts already knowing the goal.
-- **Unattended permissions (Tier 2)** — optional tap-to-approve: with
-  `spawned_mode: "ask"`, spawned sessions route Write/Edit/MCP approvals to the
-  topic as buttons. **The shipped default is `auto-allow` (fully autonomous, no
-  approval round-trip)** — see the warning under
-  [Spawning new sessions](#spawning-new-sessions--new) and
-  [Known issues](#known-issues).
+- **Risk-tiered permissions (Tier 2)** — **every** bridge session (a `/new` spawn
+  or a `/telegram`-attached session alike) routes dangerous tool calls (Write/Edit/
+  NotebookEdit, risky Bash, non-allowlisted MCP) to the topic as tap-to-approve
+  buttons; safe tools run untouched. Reply **✅ Approve**, **✅ Always allow**
+  (persists a narrow rule so it won't ask again), **✍️ Approve + note** / **✍️ Deny
+  + redirect** (your free-text reaches the session), or **⛔ Deny**. Default posture
+  is `spawned_mode: "risk-tiered"`; `auto-allow` (no round-trip) is opt-in.
 - **Images** — attach a photo in the topic; the session reads it.
 
 ## Requirements
@@ -156,11 +157,20 @@ the skill):
        { "hooks": [ { "type": "command",
          "command": "~/.telegram-bridge/telegram-self-register.py" } ] } ] } }
    ```
-3. **Tier-2 permission hook** (only if you use `/new` to spawn unattended sessions)
-   — register `telegram-permission-hook.py` as a PreToolUse hook in
-   `settings.local.json` and add the AskUserQuestion MCP from
-   `~/.telegram-bridge/telegram-auq-mcp.json`. See that file and the hook's header
-   for the matcher.
+3. **Tier-2 permission hook** (the tap-to-approve gate for bridge sessions) —
+   register `telegram-permission-hook.py` as a PreToolUse hook **in
+   `~/.claude/settings.json`**, and add the AskUserQuestion MCP from
+   `~/.telegram-bridge/telegram-auq-mcp.json`:
+   ```json
+   { "hooks": { "PreToolUse": [
+       { "matcher": "Write|Edit|NotebookEdit|Bash|mcp__.*",
+         "hooks": [ { "type": "command", "timeout": 1800,
+           "command": "~/.telegram-bridge/telegram-permission-hook.py" } ] } ] } }
+   ```
+   > **Must be `settings.json`, not `settings.local.json`.** Claude Code does not
+   > load PreToolUse hooks from `.local` in spawned/headless sessions, so a `.local`
+   > registration silently never fires. The hook self-scopes to bridge sessions (it
+   > abstains in every non-bridge session), so registering it globally is safe.
 
 ## Commands
 
@@ -186,13 +196,12 @@ Typed in the control group (handled by the Massive):
 | `/whoami` | chat_id, your user_id, current topic |
 | `/sessions` | list attached sessions |
 
-> **⚠️ `/new` spawns are autonomous by default.** A spawned session ships with
-> `spawned_mode: "auto-allow"`: it runs Write/Edit/MCP tools and answers its own
-> questions with **no tap-to-approve round-trip**. A phone message can drive a
-> session that edits files and runs commands unattended. Set `spawned_mode: "ask"`
-> in `~/.telegram-bridge/permissions.json` for tap-to-approve. See
-> [Known issues](#known-issues) — whether `auto-allow` should be the default is a
-> pending decision.
+> **ℹ️ `/new` spawns are unattended but gated.** A spawned session runs with broad
+> tool access, but under the default `spawned_mode: "risk-tiered"` every dangerous
+> tool call (Write/Edit, risky Bash, non-allowlisted MCP) is routed to your phone
+> for tap-to-approve before it runs — the same gate every bridge session uses. Set
+> `spawned_mode: "auto-allow"` in `~/.telegram-bridge/permissions.json` only if you
+> want a fully autonomous spawn with no round-trip.
 
 ## Customizing agent behavior
 
@@ -232,27 +241,23 @@ if you leave the handoff machinery alone.
 
 ## Known issues
 
-Early release. Beyond the [Caveats](#caveats), these specific items are known and
-pending the first end-to-end test:
+Early release. Beyond the [Caveats](#caveats), these specific items are known:
 
-- **Spawned-session default is fully autonomous.** `permissions.json` ships
-  `spawned_mode: "auto-allow"`: a `/new` session runs Write/Edit/MCP and answers its
-  own questions with no approval round-trip. Tap-to-approve requires
-  `spawned_mode: "ask"`. Whether `auto-allow` should be the default is an open
-  decision — it ships this way because the approval round-trip is not yet validated.
-- **AskUserQuestion requires `ask` mode.** A spawned session asks you through the
-  **AskUserQuestion MCP server** (`telegram-auq-mcp.py`), verified end-to-end:
-  single-select renders one-tap buttons (or type a number / free text); multi-select
-  renders a toggle keyboard (tap to check, then **Done**) and returns a `list[str]`.
-  A **typed** reply works for both — a number picks that option, free text is an
-  "Other" answer, `1 3` picks several, and input it can't read (out-of-range numbers,
-  numbers mixed with stray words) gets re-asked instead of silently partial. This
-  only fires under `spawned_mode: "ask"` (or with `mcp__telegram__AskUserQuestion`
-  allowlisted); under the default `auto-allow` the question is denied so the model
-  decides itself. Note the MCP server is **pinned at session start** — edits to it
-  need a session restart (`/compact` or a fresh `/new`) to take effect. The legacy
-  `telegram-askuserquestion-hook.py` is unused: native AskUserQuestion is disabled in
-  spawns and PreToolUse hooks don't fire for it.
+- **AskUserQuestion over Telegram.** A bridge session asks you through the
+  **AskUserQuestion MCP server** (`telegram-auq-mcp.py`): single-select renders
+  one-tap buttons (or type a number / free text); multi-select renders a toggle
+  keyboard (tap to check, then **Done**) and returns a `list[str]`. A **typed** reply
+  works for both — a number picks that option, free text is an "Other" answer, `1 3`
+  picks several, and input it can't read (out-of-range numbers, numbers mixed with
+  stray words) gets re-asked instead of silently partial. The MCP server is **pinned
+  at session start** — edits to it need a session restart (`/compact` or a fresh
+  `/new`) to take effect. The legacy `telegram-askuserquestion-hook.py` is unused:
+  native AskUserQuestion is disabled in spawns and PreToolUse hooks don't fire for it.
+- **Permission hook must live in `settings.json`.** Claude Code does not load
+  PreToolUse hooks from `settings.local.json` in spawned/headless sessions, so the
+  Tier-2 gate must be registered in `~/.claude/settings.json` (see
+  [Claude Code wiring](#claude-code-wiring)). A `.local` registration silently never
+  fires — the symptom is gated tools getting hard-denied instead of prompting.
 
 ## Configuration
 
@@ -260,7 +265,8 @@ pending the first end-to-end test:
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
 | `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds` |
-| `permissions.json` | spawned-session permission mode (`auto-allow` default, or `ask`) |
+| `permissions.json` | bridge-session permission posture: `risk-tiered` (default), `ask`, or `auto-allow` |
+| `spawned-allow.json` | persisted "always allow" rules (grown by the hook on ✅ Always allow; auditable JSON) |
 | `lifecycle/{style,start,save,end}.txt` | per-event behavior hooks (read live; gitignored). See [Customizing agent behavior](#customizing-agent-behavior) |
 
 Identity (owner username, user id, chat id) is **not** in any file — it's captured
@@ -294,11 +300,12 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
   readable. A stronger option — keeping the token out of the plist entirely (e.g.
   sourcing it from the Keychain or a separate 600 env file the daemon reads at
   startup) — is a future improvement; `chmod 600` is the accepted minimum for now.
-- Spawned sessions run **unattended and, by default, fully autonomous**
-  (`spawned_mode: "auto-allow"`): a phone message can drive a session that edits
-  files and runs tools with no approval round-trip. Only enable `/new` if you accept
-  that. Set `spawned_mode: "ask"` in `permissions.json` to route the riskier
-  approvals (Write/Edit/non-allowlisted MCP) back to your phone as tap-to-approve.
+- Bridge sessions are **gated by default** (`spawned_mode: "risk-tiered"`): every
+  dangerous tool call (Write/Edit, risky Bash, non-allowlisted MCP) is routed to
+  your phone for tap-to-approve before it runs — the same model for `/new` spawns and
+  `/telegram`-attached sessions. `auto-allow` (fully autonomous, no round-trip) is
+  opt-in; set it only if you accept that a phone message can then drive a session
+  that edits files and runs tools unattended.
 
 ## Caveats
 
@@ -318,11 +325,10 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
   See [Customizing agent behavior](#customizing-agent-behavior).
 - **Telegram setup gotchas.** The group MUST have **topics/forum mode enabled**,
   and the bot MUST be a group **admin** to create topics and read messages.
-- **Elevated autonomy (default).** Spawned sessions (`/new`) run with broad tool
-  access and, by default (`spawned_mode: "auto-allow"`), no approval round-trip. A
-  phone message can drive a session that edits files and runs commands. Only enable
-  `/new` if you accept that; set `spawned_mode: "ask"` for tap-to-approve. See [Security notes](#security-notes) and
-  [Known issues](#known-issues).
+- **Elevated autonomy.** Bridge sessions run with broad tool access. By default
+  (`spawned_mode: "risk-tiered"`) dangerous calls are gated to your phone for
+  approval; set `auto-allow` only if you want no round-trip. See
+  [Security notes](#security-notes).
 - **Single owner.** Bootstraps to one Telegram user; not multi-user.
 
 ## License
