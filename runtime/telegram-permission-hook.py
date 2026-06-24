@@ -153,6 +153,11 @@ def find_topic(cwd):
     """
     if not REGISTRY_DIR.is_dir():
         return None
+    # Canonicalize before comparing: the registry stores cwd as the spawn saw it
+    # (e.g. /tmp) while the hook payload / getcwd may report the symlink-resolved
+    # path (e.g. /private/tmp on macOS). realpath both sides so they agree.
+    # realpath("") == getcwd(), so skip any registry entry with a missing cwd.
+    cwd = os.path.realpath(cwd)
     cpid = _claude_ancestor_pid()
     matches = []   # (registered_at, thread_id, inbox_path)
     for f in REGISTRY_DIR.glob("*.json"):
@@ -160,7 +165,8 @@ def find_topic(cwd):
             reg = json.loads(f.read_text())
         except Exception:
             continue
-        if reg.get("cwd") != cwd or reg.get("thread_id") is None:
+        rc = reg.get("cwd")
+        if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
             continue
         entry = (str(reg.get("registered_at", "")), str(reg["thread_id"]), reg.get("inbox_path"))
         if cpid is not None and reg.get("claude_pid") == cpid:

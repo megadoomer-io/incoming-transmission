@@ -240,15 +240,19 @@ pending the first end-to-end test:
   own questions with no approval round-trip. Tap-to-approve requires
   `spawned_mode: "ask"`. Whether `auto-allow` should be the default is an open
   decision — it ships this way because the approval round-trip is not yet validated.
-- **AskUserQuestion has one supported path and two unverified ones.** The intended,
-  supported channel for an unattended spawn to ask you a question is the
-  **AskUserQuestion MCP server** (`telegram-auq-mcp.py`), where a button **tap** is
-  delivered to the session via `auq-answer.json`. Two alternates are present but
-  unverified pending a runtime test: (a) a **typed** (non-button) answer to an MCP
-  question lands in the inbox, not `auq-answer.json`, so the MCP server doesn't see
-  it — use the buttons; (b) `telegram-askuserquestion-hook.py` is a PreToolUse-hook
-  variant that keys on a `via=="callback-auq"` marker the router doesn't currently
-  emit. Prefer the MCP server + button taps until the alternates are tested.
+- **AskUserQuestion requires `ask` mode.** A spawned session asks you through the
+  **AskUserQuestion MCP server** (`telegram-auq-mcp.py`), verified end-to-end:
+  single-select renders one-tap buttons (or type a number / free text); multi-select
+  renders a toggle keyboard (tap to check, then **Done**) and returns a `list[str]`.
+  A **typed** reply works for both — a number picks that option, free text is an
+  "Other" answer, `1 3` picks several, and input it can't read (out-of-range numbers,
+  numbers mixed with stray words) gets re-asked instead of silently partial. This
+  only fires under `spawned_mode: "ask"` (or with `mcp__telegram__AskUserQuestion`
+  allowlisted); under the default `auto-allow` the question is denied so the model
+  decides itself. Note the MCP server is **pinned at session start** — edits to it
+  need a session restart (`/compact` or a fresh `/new`) to take effect. The legacy
+  `telegram-askuserquestion-hook.py` is unused: native AskUserQuestion is disabled in
+  spawns and PreToolUse hooks don't fire for it.
 
 ## Configuration
 

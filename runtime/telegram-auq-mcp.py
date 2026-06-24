@@ -36,6 +36,7 @@
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -93,6 +94,11 @@ def _find_topic(cwd: str):
     """
     if not REGISTRY_DIR.is_dir():
         return None
+    # Match on the canonical (symlink-resolved) path: the registry stores the
+    # cwd as the spawn saw it (e.g. /tmp) but os.getcwd() here returns the real
+    # path (e.g. /private/tmp on macOS), so a raw string compare misses. realpath
+    # both sides. realpath("") == getcwd(), so a missing reg cwd must be skipped.
+    cwd = os.path.realpath(cwd)
     cpid = _claude_ancestor_pid()
     matches = []   # (registered_at, thread_id, session_dir)
     for f in REGISTRY_DIR.glob("*.json"):
@@ -100,7 +106,8 @@ def _find_topic(cwd: str):
             reg = json.loads(f.read_text())
         except Exception:
             continue
-        if reg.get("cwd") != cwd or reg.get("thread_id") is None:
+        rc = reg.get("cwd")
+        if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
             continue
         inbox = reg.get("inbox_path") or ""
         session_dir = str(Path(inbox).parent) if inbox else ""
@@ -155,19 +162,99 @@ def _render(q, idx, total):
                      else "{}) {}".format(i + 1, label))
     lines.append("")
     if q.get("multiSelect"):
-        lines.append("(multi-select: this records one pick)")
-    lines.append("Tap a button, or reply with the number / your own text. "
-                 "I'll wait for your answer (no auto-pick).")
+        lines.append("Multi-select: tap options to toggle (✅), then tap ✅ Done. "
+                     "Or reply with the numbers, e.g. \"1 3\". I'll wait (no auto-pick).")
+    else:
+        lines.append("Tap a button, or reply with the number / your own text. "
+                     "I'll wait for your answer (no auto-pick).")
     return "\n".join(lines)
 
 
 def _keyboard(q, thread_id, qidx):
+    options = q.get("options", []) or []
+    multi = bool(q.get("multiSelect"))
     rows = []
-    for i, opt in enumerate(q.get("options", []) or []):
+    for i, opt in enumerate(options):
         label = str(opt.get("label", "option {}".format(i)))
-        rows.append([{"text": "{}. {}".format(i + 1, _clip(label, 50)),
-                      "callback_data": "auq:{}:{}:{}".format(thread_id, qidx, i)}])
-    return {"inline_keyboard": rows} if rows else None
+        if multi:
+            # Toggle button: starts unchecked. Each tap flips the mark; the router
+            # re-renders this keyboard in place (callback auqm:<thread>:<qidx>:<oidx>).
+            rows.append([{"text": "▫️ {}. {}".format(i + 1, _clip(label, 48)),
+                          "callback_data": "auqm:{}:{}:{}".format(thread_id, qidx, i)}])
+        else:
+            rows.append([{"text": "{}. {}".format(i + 1, _clip(label, 50)),
+                          "callback_data": "auq:{}:{}:{}".format(thread_id, qidx, i)}])
+    if not rows:
+        return None
+    if multi:
+        rows.append([{"text": "✅ Done",
+                      "callback_data": "auqd:{}:{}".format(thread_id, qidx)}])
+    return {"inline_keyboard": rows}
+
+
+def _interpret(rec, options, multi):
+    """Classify a router-written answer record. Returns (kind, value):
+
+      ("answer", <str for single-select | list[str] for multi-select>) usable answer
+      ("ambiguous", <reason>)   a typed MULTI reply we can't read cleanly
+                                (out-of-range numbers, or numbers mixed with
+                                stray words) -> re-ask, never silently partial
+      ("none", None)            nothing usable yet (keep waiting)
+
+    Button taps ({"oidx"}/{"selected"}) and single-select replies are always an
+    answer. For a typed multi reply: no numbers -> free-form answer; a clean
+    in-range number list -> those options; anything ambiguous -> ("ambiguous").
+
+    Record shapes the router writes:
+      {"oidx": N}        single-select button tap (0-based)
+      {"selected": [..]} multi-select Done (0-based option indices)
+      {"text": "..."}    a typed reply
+    """
+    def label(i):
+        return str(options[i].get("label", "option {}".format(i)))
+    n = len(options)
+
+    sel = rec.get("selected")
+    if isinstance(sel, list):
+        labs = [label(i) for i in sel if isinstance(i, int) and 0 <= i < n]
+        return ("answer", labs) if labs else ("none", None)
+
+    oidx = rec.get("oidx")
+    if isinstance(oidx, int) and 0 <= oidx < n:
+        return ("answer", label(oidx))
+
+    text = str(rec.get("text", "")).strip()
+    if not text:
+        return ("none", None)
+
+    if not multi:
+        # single-select: a bare in-range number picks that option; anything else
+        # is a free-form "Other" answer.
+        if text.isdigit():
+            k = int(text) - 1
+            if 0 <= k < n:
+                return ("answer", label(k))
+        return ("answer", text)
+
+    # multi-select typed reply
+    nums = re.findall(r"\d+", text)
+    if not nums:
+        return ("answer", [text])                    # free-form -> single-element list
+    idxs = [int(t) - 1 for t in nums]
+    out_range = [i + 1 for i in idxs if not (0 <= i < n)]
+    # Anything left after stripping numbers, separators, and connector words means
+    # the reply mixed option-numbers with free text -> we can't tell what they meant.
+    leftover = re.sub(r"[\d\s,&+/.-]+|\b(?:and|or)\b", " ", text, flags=re.I).strip()
+    if out_range or leftover:
+        bits = []
+        if out_range:
+            bits.append("{} isn't on the list".format(
+                ", ".join(str(x) for x in out_range)))
+        if leftover:
+            bits.append("couldn't map {!r}".format(leftover))
+        return ("ambiguous", "; ".join(bits))
+    labs = [label(i) for i in dict.fromkeys(idxs)]   # dedupe, preserve order
+    return ("answer", labs) if labs else ("none", None)
 
 
 @mcp.tool()
@@ -178,13 +265,15 @@ def AskUserQuestion(questions: list[dict[str, Any]]) -> dict[str, Any]:
     `questions` is an object:
       - question (str):   the question text
       - header (str):     a short label/topic for the question
-      - multiSelect (bool): whether multiple options may be chosen (this MVP
-                            records a single pick)
+      - multiSelect (bool): whether multiple options may be chosen (rendered as a
+                            toggle keyboard with a Done button)
       - options (list):   [{label: str, description: str}, ...]
 
-    Returns {"answers": {<question text>: <chosen option label or typed text>}}.
-    On no answer within the wait window, returns {"answers": {}, "timed_out": true}
-    so you can re-ask or proceed without fabricating a choice.
+    Returns {"answers": {<question text>: <answer>}} where <answer> is a string for
+    single-select and a list[str] for multi-select (each chosen option's label; a
+    free-form multi reply is a single-element list). On no answer within the wait
+    window, returns {"answers": {...}, "timed_out": true} so you can re-ask or
+    proceed without fabricating a choice.
     """
     token = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN")
     cwd = os.getcwd()
@@ -195,14 +284,31 @@ def AskUserQuestion(questions: list[dict[str, Any]]) -> dict[str, Any]:
         return {"answers": {}, "error": "telegram bridge not available for this session"}
     thread_id, session_dir = topic
     answer_file = Path(session_dir) / "auq-answer.json"
+    pending_file = Path(session_dir) / "auq-pending.json"
 
     answers: dict[str, str] = {}
     total = len(questions)
     for qidx, q in enumerate(questions):
         options = q.get("options", []) or []
+        multi = bool(q.get("multiSelect"))
         try:
             answer_file.unlink()           # clear any stale answer
         except FileNotFoundError:
+            pass
+        # Pending marker: tells the router an answer is awaited for this topic, so
+        # it (a) routes a typed reply into answer_file instead of the task inbox
+        # and (b) can re-render the multi-select toggle keyboard from the option
+        # labels + current checks. Removed below once answered or timed out.
+        try:
+            pending_file.write_text(json.dumps({
+                "qidx": qidx,
+                "thread_id": thread_id,
+                "multiSelect": multi,
+                "options": [str(o.get("label", "option {}".format(i)))
+                            for i, o in enumerate(options)],
+                "selected": [],
+            }))
+        except OSError:
             pass
         _send(token, chat_id, thread_id, _render(q, qidx, total),
               reply_markup=_keyboard(q, thread_id, qidx))
@@ -221,18 +327,28 @@ def AskUserQuestion(questions: list[dict[str, Any]]) -> dict[str, Any]:
                 answer_file.unlink()
             except FileNotFoundError:
                 pass
-            oidx = rec.get("oidx")
-            text = str(rec.get("text", "")).strip()
-            if isinstance(oidx, int) and 0 <= oidx < len(options):
-                chosen = str(options[oidx].get("label", "option {}".format(oidx)))
-            elif text:
-                chosen = text              # free-text "Other" escape
+            kind, value = _interpret(rec, options, multi)
+            if kind == "answer":
+                chosen = value
+            elif kind == "ambiguous":
+                # Don't silently accept a partial. Re-ask and keep waiting; the
+                # toggle keyboard is still live and pending is still set.
+                _send(token, chat_id, thread_id,
+                      "🤔 Couldn't read that as a pick — {}.\nTap the buttons above, "
+                      "reply with just the numbers (e.g. \"1 3\"), or send a message "
+                      "with no numbers for a free-form answer.".format(value))
+            # else "none": keep waiting
+        try:
+            pending_file.unlink()          # answered or timed out: stop intercepting
+        except FileNotFoundError:
+            pass
         if chosen is None:
             _send(token, chat_id, thread_id,
                   "⏱ No answer in {}m — not picking for you.".format(
                       round(WAIT_TIMEOUT_S / 60)))
             return {"answers": answers, "timed_out": True}
-        _send(token, chat_id, thread_id, "✓ Recorded: {}".format(chosen))
+        shown = ", ".join(chosen) if isinstance(chosen, list) else str(chosen)
+        _send(token, chat_id, thread_id, "✓ Recorded: {}".format(shown))
         answers[str(q.get("question", "Q{}".format(qidx + 1)))] = chosen
 
     return {"answers": answers}

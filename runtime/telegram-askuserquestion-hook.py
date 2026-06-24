@@ -125,12 +125,16 @@ def find_topic(cwd):
     """Return (thread_id, inbox_path) for the registry entry matching cwd."""
     if not REGISTRY_DIR.is_dir():
         return None
+    # realpath both sides: registry stores the spawn-seen cwd (e.g. /tmp) but the
+    # caller may pass the symlink-resolved path (e.g. /private/tmp on macOS).
+    cwd = os.path.realpath(cwd)
     for f in REGISTRY_DIR.glob("*.json"):
         try:
             reg = json.loads(f.read_text())
         except Exception:
             continue
-        if reg.get("cwd") == cwd and reg.get("thread_id") is not None:
+        rc = reg.get("cwd")
+        if rc and os.path.realpath(rc) == cwd and reg.get("thread_id") is not None:
             return str(reg["thread_id"]), reg.get("inbox_path")
     return None
 

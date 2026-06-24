@@ -38,6 +38,7 @@ for f in "$REPO_DIR"/runtime/*; do
     base="$(basename "$f")"
     case "$base" in
         *.template|*.example|*.example.txt|*.example.json) continue ;;
+        permissions.json) continue ;;   # spawned-session posture; seeded below, never clobbered
     esac
     cp "$f" "$PREFIX/$base"
     echo "installed $PREFIX/$base"
@@ -64,6 +65,16 @@ if [ ! -f "$PREFIX/dir-aliases.json" ]; then
     echo "seeded $PREFIX/dir-aliases.json (edit this with your repos)"
 else
     echo "kept existing $PREFIX/dir-aliases.json"
+fi
+
+# 3a. Seed permissions.json (spawned-session posture) from the repo default only if
+#     the user has none yet. Re-running install must NOT reset a posture the user
+#     chose (e.g. "ask") — like dir-aliases, this is local config we preserve.
+if [ ! -f "$PREFIX/permissions.json" ]; then
+    cp "$REPO_DIR/runtime/permissions.json" "$PREFIX/permissions.json"
+    echo "seeded $PREFIX/permissions.json (spawned_mode: auto-allow)"
+else
+    echo "kept existing $PREFIX/permissions.json"
 fi
 
 # 3b. Seed the lifecycle hooks from their examples, only if absent. These are the

@@ -304,6 +304,38 @@ def clear_buttons(chat_id, message_id):
         log("WARN editMessageReplyMarkup: {}".format(e))
 
 
+def set_buttons(chat_id, message_id, markup):
+    """Replace a message's inline keyboard in place (multi-select toggle)."""
+    if chat_id is None or message_id is None or markup is None:
+        return
+    try:
+        api_call("editMessageReplyMarkup", {
+            "chat_id": chat_id, "message_id": message_id,
+            "reply_markup": json.dumps(markup)})
+    except (urllib.error.URLError, OSError) as e:
+        log("WARN editMessageReplyMarkup(set): {}".format(e))
+
+
+def auq_multi_markup(tkey, pending):
+    """Build the multi-select toggle keyboard from a pending-question record.
+
+    The MCP server writes the option labels + current selection into
+    auq-pending.json; we render one toggle button per option (✅ when selected,
+    ▫️ when not) plus a Done button. callback_data mirrors the MCP's scheme so the
+    initial keyboard and our re-renders are interchangeable.
+    """
+    opts = pending.get("options") or []
+    selected = set(pending.get("selected") or [])
+    qidx = pending.get("qidx", 0)
+    rows = []
+    for i, label in enumerate(opts):
+        mark = "✅" if i in selected else "▫️"
+        rows.append([{"text": "{} {}. {}".format(mark, i + 1, str(label)[:48]),
+                      "callback_data": "auqm:{}:{}:{}".format(tkey, qidx, i)}])
+    rows.append([{"text": "✅ Done", "callback_data": "auqd:{}:{}".format(tkey, qidx)}])
+    return {"inline_keyboard": rows}
+
+
 # --- status sticky (pinned per-topic context gauge) ------------------------
 #
 # Each attached topic shows a phone-can't-see-the-statusbar gauge as a pinned
@@ -979,6 +1011,24 @@ def handle_message(msg, state):
     inbox = Path(reg["inbox_path"])
     inbox.parent.mkdir(parents=True, exist_ok=True)
 
+    # AskUserQuestion in progress for this topic? A typed reply is the ANSWER, not
+    # a new task: route it to the answer file the MCP server polls (instead of the
+    # task inbox, which the blocked session can't drain anyway). The MCP maps a
+    # bare number to that option, free text to an "Other" answer, and "1 3" to
+    # multiple. Only plain text (no image) is treated as an answer; images and the
+    # no-pending case fall through to normal routing.
+    auq_pending = inbox.parent / "auq-pending.json"
+    if text and not image_file_id and auq_pending.exists():
+        try:
+            (inbox.parent / "auq-answer.json").write_text(json.dumps({
+                "text": text, "ts": now_iso()}))
+            react_eyes(chat_id, message_id)
+            record_msg_thread(message_id, tkey)
+            log("routed AUQ typed-reply -> topic {} ({})".format(tkey, reg.get("cwd")))
+            return
+        except OSError as e:
+            log("ERROR auq typed-reply write: {}; falling back to inbox".format(e))
+
     image_path = None
     if image_file_id:
         image_path = download_file(image_file_id, inbox.parent / "images", str(message_id))
@@ -1061,12 +1111,17 @@ def handle_reaction(mr, state):
 
 
 def handle_callback(cq, state):
-    """An inline approval button was tapped (Tier-2 permission prompt).
+    """An inline button was tapped. Four callback_data namespaces converge here:
 
-    callback_data is "tg:<y|n>:<thread_id>". We inject a synthetic y/n line into
-    that topic's inbox so the blocking permission hook (which polls the inbox)
-    consumes it exactly like a typed reply, then ack the tap and strip the
-    keyboard so it can't be tapped twice.
+      tg:<y|n>:<thread>            permission Approve/Deny -> synthetic y/n inbox
+                                   line the in-session permission hook polls.
+      auq:<thread>:<qidx>:<oidx>   single-select AUQ choice -> auq-answer.json the
+                                   MCP server polls.
+      auqm:<thread>:<qidx>:<oidx>  multi-select toggle -> flip the option in
+                                   auq-pending.json and re-render the keyboard in
+                                   place (no answer written yet).
+      auqd:<thread>:<qidx>         multi-select Done -> write the selected list to
+                                   auq-answer.json.
     """
     cq_id = cq.get("id")
     frm = cq.get("from", {}) or {}
@@ -1077,68 +1132,140 @@ def handle_callback(cq, state):
     chat_id = chat.get("id")
     message_id = message.get("message_id")
 
-    # Owner lock: only the bootstrapped owner may approve/deny.
+    # Owner lock: only the bootstrapped owner may tap.
     if state.get("allowed_user_id") is None or from_id != state.get("allowed_user_id"):
         answer_callback(cq_id, "Not authorized")
         return
 
-    # Two button namespaces converge here, each delivered to a blocking poller:
-    #   tg:<y|n>:<thread>          -> permission Approve/Deny: synthetic inbox line
-    #                                 the permission hook (in-session) polls.
-    #   auq:<thread>:<qidx>:<oidx> -> AskUserQuestion choice: a response file
-    #                                 <session_dir>/auq-answer.json the MCP server polls.
     parts = data.split(":")
     kind = parts[0] if parts else ""
+
+    def resolve(tkey):
+        reg = load_registry(tkey)
+        if reg is None or not reg.get("inbox_path"):
+            return None, None
+        return reg, Path(reg["inbox_path"]).parent
+
+    # --- permission Approve/Deny: synthetic y/n line the hook polls ---
     if kind == "tg" and len(parts) == 3:
         decision, tkey = parts[1], parts[2]
-        answer, toast = ("y", "Approved ✅") if decision == "y" else ("n", "Denied ⛔")
-        logval = answer
-    elif kind == "auq" and len(parts) == 4:
+        reg, _ = resolve(tkey)
+        if reg is None:
+            answer_callback(cq_id, "Session is gone")
+            clear_buttons(chat_id, message_id)
+            return
+        answer = "y" if decision == "y" else "n"
+        try:
+            with Path(reg["inbox_path"]).open("a") as fh:
+                fh.write(json.dumps({
+                    "ts": now_iso(), "message_id": message_id, "from": from_id,
+                    "username": frm.get("username"), "text": answer,
+                    "via": "callback"}) + "\n")
+        except OSError as e:
+            log("ERROR callback write: {}".format(e))
+            answer_callback(cq_id, "Error")
+            return
+        answer_callback(cq_id, "Approved ✅" if decision == "y" else "Denied ⛔")
+        clear_buttons(chat_id, message_id)
+        log("callback {} (tg) -> topic {} ({})".format(answer, tkey, reg.get("cwd")))
+        return
+
+    # --- single-select AUQ tap -> answer file ---
+    if kind == "auq" and len(parts) == 4:
         tkey, qidx_s, oidx_s = parts[1], parts[2], parts[3]
         try:
             oidx = int(oidx_s)
         except ValueError:
             answer_callback(cq_id)
             return
-        toast = "Selected option {}".format(oidx + 1)
-        logval = "opt{}".format(oidx)
-    else:
-        answer_callback(cq_id)
-        return
-
-    reg = load_registry(tkey)
-    if reg is None or not reg.get("inbox_path"):
-        answer_callback(cq_id, "Session is gone")
-        clear_buttons(chat_id, message_id)
-        return
-
-    session_dir = Path(reg["inbox_path"]).parent
-    try:
-        session_dir.mkdir(parents=True, exist_ok=True)
-        if kind == "auq":
+        reg, session_dir = resolve(tkey)
+        if reg is None:
+            answer_callback(cq_id, "Session is gone")
+            clear_buttons(chat_id, message_id)
+            return
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
             (session_dir / "auq-answer.json").write_text(json.dumps({
-                "oidx": oidx,
-                "qidx": int(qidx_s) if qidx_s.isdigit() else None,
-                "ts": now_iso(),
-            }))
-        else:
-            with Path(reg["inbox_path"]).open("a") as fh:
-                fh.write(json.dumps({
-                    "ts": now_iso(),
-                    "message_id": message_id,
-                    "from": from_id,
-                    "username": frm.get("username"),
-                    "text": answer,
-                    "via": "callback",
-                }) + "\n")
-    except OSError as e:
-        log("ERROR callback write: {}".format(e))
-        answer_callback(cq_id, "Error")
+                "oidx": oidx, "qidx": int(qidx_s) if qidx_s.isdigit() else None,
+                "ts": now_iso()}))
+        except OSError as e:
+            log("ERROR callback write: {}".format(e))
+            answer_callback(cq_id, "Error")
+            return
+        answer_callback(cq_id, "Selected option {}".format(oidx + 1))
+        clear_buttons(chat_id, message_id)
+        log("callback opt{} (auq) -> topic {} ({})".format(oidx, tkey, reg.get("cwd")))
         return
 
-    answer_callback(cq_id, toast)
-    clear_buttons(chat_id, message_id)
-    log("callback {} ({}) -> topic {} ({})".format(logval, kind, tkey, reg.get("cwd")))
+    # --- multi-select toggle -> flip in pending, re-render keyboard ---
+    if kind == "auqm" and len(parts) == 4:
+        tkey, _qidx_s, oidx_s = parts[1], parts[2], parts[3]
+        try:
+            oidx = int(oidx_s)
+        except ValueError:
+            answer_callback(cq_id)
+            return
+        reg, session_dir = resolve(tkey)
+        if reg is None:
+            answer_callback(cq_id, "Session is gone")
+            clear_buttons(chat_id, message_id)
+            return
+        pending_file = session_dir / "auq-pending.json"
+        try:
+            pending = json.loads(pending_file.read_text())
+        except (OSError, ValueError):
+            answer_callback(cq_id, "Question expired")
+            clear_buttons(chat_id, message_id)
+            return
+        opts = pending.get("options") or []
+        selected = [s for s in (pending.get("selected") or []) if isinstance(s, int)]
+        name = opts[oidx] if 0 <= oidx < len(opts) else "option {}".format(oidx + 1)
+        if oidx in selected:
+            selected = [s for s in selected if s != oidx]
+            toast = "✗ {}".format(name)
+        else:
+            selected.append(oidx)
+            toast = "✓ {}".format(name)
+        pending["selected"] = selected
+        try:
+            pending_file.write_text(json.dumps(pending))
+        except OSError:
+            pass
+        set_buttons(chat_id, message_id, auq_multi_markup(tkey, pending))
+        answer_callback(cq_id, toast)
+        return
+
+    # --- multi-select Done -> write the selected list ---
+    if kind == "auqd" and len(parts) == 3:
+        tkey = parts[1]
+        reg, session_dir = resolve(tkey)
+        if reg is None:
+            answer_callback(cq_id, "Session is gone")
+            clear_buttons(chat_id, message_id)
+            return
+        pending_file = session_dir / "auq-pending.json"
+        try:
+            pending = json.loads(pending_file.read_text())
+        except (OSError, ValueError):
+            answer_callback(cq_id, "Question expired")
+            clear_buttons(chat_id, message_id)
+            return
+        selected = [s for s in (pending.get("selected") or []) if isinstance(s, int)]
+        try:
+            (session_dir / "auq-answer.json").write_text(json.dumps({
+                "selected": selected, "qidx": pending.get("qidx"),
+                "ts": now_iso()}))
+        except OSError as e:
+            log("ERROR callback write: {}".format(e))
+            answer_callback(cq_id, "Error")
+            return
+        answer_callback(cq_id, "Recorded {} pick(s)".format(len(selected)))
+        clear_buttons(chat_id, message_id)
+        log("callback done (auqd {} sel) -> topic {} ({})".format(
+            len(selected), tkey, reg.get("cwd")))
+        return
+
+    answer_callback(cq_id)
 
 
 # --- main loop -------------------------------------------------------------

@@ -7,6 +7,28 @@ incoming-transmission an **agnostic transport** that injects only
 transport-necessary mechanism, with all operator-style behavior moved behind a
 documented, user-amendable seam (default = normal Claude).
 
+### Added
+- **AskUserQuestion over Telegram (verified end-to-end).** A spawned session asks
+  the owner through the `mcp__telegram__AskUserQuestion` MCP server: single-select
+  options render as one-tap buttons; multi-select renders a toggle keyboard (tap to
+  check, then Done) and returns a `list[str]`. **Typed replies** now work — a number
+  picks that option, free text is an "Other" answer, `1 3` picks several — with a
+  re-prompt on input that mixes out-of-range numbers or stray words instead of a
+  silent partial. Fires under `spawned_mode: "ask"` (or with the tool allowlisted);
+  `auto-allow` still denies the question so an unattended model self-decides.
+  (`telegram-auq-mcp.py`, `telegram-router.py`.)
+
+### Fixed
+- **Symlinked cwd broke session-topic lookup.** The registry stored a session's cwd
+  as the spawn saw it (e.g. `/tmp`) while the MCP server and permission hook resolve
+  `os.getcwd()` (e.g. `/private/tmp` on macOS), so the topic match silently failed and
+  AUQ / approval round-trips couldn't reach the session. Both sides now compare
+  canonical `realpath`s. (`telegram-auq-mcp.py`, `telegram-permission-hook.py`,
+  `telegram-askuserquestion-hook.py`.)
+- **`install.sh` reset spawned-session posture on every run.** It copied
+  `runtime/permissions.json` over the deployed copy, clobbering a user-chosen
+  `spawned_mode`. Now seeded only when absent, like `dir-aliases.json`.
+
 ### Changed
 - **Smart-router / dumb-session redesign (core).** Moved polling/timing
   intelligence from per-session poll crons into the router daemon. The router now
