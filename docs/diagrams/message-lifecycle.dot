@@ -1,0 +1,39 @@
+// Message Lifecycle
+// One transmission from tap to reply: route to inbox, push a drain nudge, and the
+// backstop that re-nudges an undrained inbox. Shows why a busy session never drops
+// a message and why an idle session costs zero tokens.
+//
+// Render: dot -Tsvg message-lifecycle.dot -o message-lifecycle.svg
+
+digraph message_lifecycle {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    recv   [label="message arrives\n(getUpdates)"];
+    route  [label="route by thread_id\nappend to inbox.jsonl"];
+    push   [label="push: send-keys drain nudge\nto session pane (pid match)", fillcolor="#fffde7"];
+    busy   [label="session idle?", shape=diamond, fillcolor="#fffde7"];
+
+    drain  [label="DRAIN (section A)\nmkdir poll.lock.d · read past read.offset"];
+    proc   [label="process each line\nfull context · tools · memory\n(image_path → Read first)"];
+    reply  [label="reply: telegram-send.sh", fillcolor="#e8f0fe", color="#1a73e8"];
+    offset [label="write read.offset\nrmdir poll.lock.d"];
+
+    wait   [label="nudge buffers\n(message stays in inbox)", fillcolor="#fef6f5"];
+    back   [label="context_loop backstop\ninbox undrained past\nbackstop_seconds (≤5m)?", shape=diamond, fillcolor="#fef6f5"];
+    renudge[label="re-nudge\n(throttled; only while non-empty)", fillcolor="#fef6f5"];
+    idle   [label="inbox drained →\nno nudge, zero tokens", fillcolor="#e6f4ea"];
+
+    recv -> route -> push -> busy;
+    busy -> drain  [label="yes — drain now"];
+    busy -> wait   [label="no — mid-task"];
+
+    drain -> proc -> reply -> offset -> idle;
+
+    wait -> back;
+    back -> renudge [label="yes"];
+    back -> wait    [label="not yet"];
+    renudge -> busy [label="retry when idle"];
+}

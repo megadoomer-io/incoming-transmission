@@ -87,6 +87,10 @@ Phone topic <──────────────────────�
 - **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
   safety net for a session wedged on an interactive prompt nobody can answer.
 
+See [docs/architecture.md](docs/architecture.md) for the full picture — diagrams of
+the system topology, the message lifecycle (push delivery + backstop), the
+compaction handoff (PAK transfer), and the Tier-2 permission round-trip.
+
 ## Features
 
 - **One reader, many sessions** — single-consumer routing by topic; no polling collisions.

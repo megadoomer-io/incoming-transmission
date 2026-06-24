@@ -1,0 +1,62 @@
+// Compaction Handoff (PAK transfer)
+// A filling session can't shrink its own context, so it rolls over to a fresh
+// replacement in the SAME topic. The lock + handshake guarantee the old and new
+// sessions never drain at once and no transmission is dropped or double-answered.
+//
+// Render: dot -Tsvg compaction-handoff.dot -o compaction-handoff.svg
+
+digraph compaction_handoff {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    subgraph cluster_router {
+        label="The Massive (context_loop)";
+        style=filled;
+        color="#fff9c4";
+        fillcolor="#fffde7";
+
+        trig [label="gauge crosses trigger_pct\n(not already compacting)"];
+        nudge[label="nudge /compact"];
+    }
+
+    subgraph cluster_old {
+        label="Outgoing Invader (old session)";
+        style=filled;
+        color="#fce8e6";
+        fillcolor="#fef6f5";
+
+        save  [label="run SAVE hook →\nwrite SESS/context-restore.md"];
+        lock  [label="touch compacting.lock\nrm handoff-ready"];
+        spawn [label="telegram-spawn.sh\n--attach <thread>\n--restore context-restore.md"];
+        wait  [label="wait for handoff-ready\n(≤5 min)", shape=diamond, fillcolor="#fffde7"];
+        release[label="rm compacting.lock\n(releases replacement)"];
+        retire[label="retire tmux window\n(DEAD- rename or kill)\nSTOP"];
+        abort [label="⚠️ replacement not ready →\nrm lock, stay live", fillcolor="#ffe0e0"];
+    }
+
+    subgraph cluster_new {
+        label="Incoming Invader (replacement, same topic)";
+        style=filled;
+        color="#e8f0fe";
+        fillcolor="#f8faff";
+
+        restore [label="START hook restores\nfrom context-restore.md"];
+        attach  [label="/telegram attach mode\n(reuse thread, no new topic)"];
+        ready   [label="touch handoff-ready"];
+        held    [label="wait while compacting.lock\nexists (no drain yet)", shape=diamond, fillcolor="#fffde7"];
+        live    [label="begin draining —\nfresh PAK, full window", fillcolor="#e6f4ea"];
+    }
+
+    trig -> nudge -> save -> lock -> spawn;
+    spawn -> restore [label="new process", style=dashed];
+    restore -> attach -> ready -> held;
+    spawn -> wait;
+    wait -> abort   [label="timeout"];
+    ready -> wait   [label="signals ready", style=dotted];
+    wait -> release [label="ready seen"];
+    release -> held [label="lock gone", style=dotted];
+    held -> live    [label="proceed"];
+    release -> retire;
+}
