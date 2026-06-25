@@ -139,13 +139,9 @@ Done. Next steps (not automated — you stay in control):
      on your phone); see the README "Claude Code wiring" snippet.
    - (optional) AskUserQuestion MCP from $PREFIX/telegram-auq-mcp.json
 
-6. (optional) Start the wedge watchdog (renders its plist + loads it, like the
-   router; needs TELEGRAM_BRIDGE_BOT_TOKEN in the env):
-     telegram-bridge watchdog-start
+6. In any Claude Code session, run /telegram to attach it to a topic.
 
-7. In any Claude Code session, run /telegram to attach it to a topic.
-
-8. (optional) Customize agent behavior via the lifecycle hooks in
+7. (optional) Customize agent behavior via the lifecycle hooks in
    $PREFIX/lifecycle/ (read live by the session at each lifecycle moment):
      style.txt  - reply formatting for every bridged session (default: empty)
      start.txt  - restore context on a spawned/rollover birth (default: read handoff)

@@ -8,9 +8,6 @@ set -euo pipefail
 PLIST_NAME="com.telegram.bridge"
 PLIST_SOURCE="$HOME/.telegram-bridge/$PLIST_NAME.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
-WATCHDOG_NAME="com.telegram.watchdog"
-WATCHDOG_SOURCE="$HOME/.telegram-bridge/$WATCHDOG_NAME.plist"
-WATCHDOG_DEST="$HOME/Library/LaunchAgents/$WATCHDOG_NAME.plist"
 STATE_DIR="$HOME/.local/state/telegram-bridge"
 STATE_FILE="$STATE_DIR/state.json"
 LOG_FILE="$STATE_DIR/router.log"
@@ -98,46 +95,6 @@ cmd_start() {
     echo "telegram-bridge started"
 }
 
-cmd_watchdog_start() {
-    if launchctl list "$WATCHDOG_NAME" &>/dev/null; then
-        echo "telegram watchdog is already running"
-        return 0
-    fi
-    if [ ! -f "$WATCHDOG_SOURCE" ]; then
-        echo "Error: watchdog plist template not found at $WATCHDOG_SOURCE" >&2
-        echo "Run ./install.sh from the incoming-transmission repo first." >&2
-        return 1
-    fi
-    local token="${TELEGRAM_BRIDGE_BOT_TOKEN:-}"
-    if [ -z "$token" ]; then
-        echo "Error: TELEGRAM_BRIDGE_BOT_TOKEN not set." >&2
-        echo "Set TELEGRAM_BRIDGE_BOT_TOKEN before starting the watchdog." >&2
-        return 1
-    fi
-    mkdir -p "$STATE_DIR"
-
-    sed -e "s|__HOME__|$HOME|g" \
-        -e "s|__STATE_DIR__|$STATE_DIR|g" \
-        -e "s|__TOKEN__|$token|g" \
-        "$WATCHDOG_SOURCE" > "$WATCHDOG_DEST"
-    # Same as the bridge plist: the token is rendered in plaintext, so 600 it.
-    chmod 600 "$WATCHDOG_DEST"
-
-    launchctl bootstrap "gui/$(id -u)" "$WATCHDOG_DEST"
-    echo "telegram watchdog started"
-}
-
-cmd_watchdog_stop() {
-    if ! launchctl list "$WATCHDOG_NAME" &>/dev/null; then
-        echo "telegram watchdog is not running"
-        rm -f "$WATCHDOG_DEST"
-        return 0
-    fi
-    launchctl bootout "gui/$(id -u)/$WATCHDOG_NAME"
-    rm -f "$WATCHDOG_DEST"
-    echo "telegram watchdog stopped"
-}
-
 cmd_stop() {
     if ! launchctl list "$PLIST_NAME" &>/dev/null; then
         echo "telegram-bridge is not running"
@@ -208,8 +165,6 @@ Commands:
   restart         Stop then start
   status          Show daemon status, owner, chat id, attached topics
   log             Tail the router log
-  watchdog-start  Start the wedge watchdog (renders + loads its launchd plist)
-  watchdog-stop   Stop the wedge watchdog
   help            Show this help message
 
 First run: set TELEGRAM_BRIDGE_ALLOWED_USERNAME to lock the bridge to your
@@ -224,8 +179,6 @@ case "${1:-help}" in
     restart)        cmd_restart ;;
     status)         cmd_status ;;
     log)            cmd_log ;;
-    watchdog-start) cmd_watchdog_start ;;
-    watchdog-stop)  cmd_watchdog_stop ;;
     help)           cmd_help ;;
     *)
         echo "Unknown command: $1" >&2

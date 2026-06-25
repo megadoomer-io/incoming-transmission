@@ -25,6 +25,7 @@
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -67,7 +68,8 @@ CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
 # shipped compaction.json.
 CONFIG_FILE = BRIDGE_DIR / "compaction.json"
 CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
-                   "context_interval_seconds": 90, "backstop_seconds": 300}
+                   "context_interval_seconds": 90, "backstop_seconds": 300,
+                   "wedge_dwell_seconds": 300}
 
 LONG_POLL_SECONDS = 30
 # socket timeout must exceed the long-poll window so the connection isn't torn
@@ -95,6 +97,14 @@ _caffeinate = None  # Popen handle for the keep-awake child
 # the GIL; this is best-effort throttling, so the rare cross-thread race (one
 # extra or one skipped nudge) is harmless.
 _backstop_nudged_at = {}
+# Wedge tracking: tkey -> {"sig": <prompt signature>, "first_seen": <monotonic>,
+# "acted": <bool>}. A bridged session can wedge on a native blocking prompt the
+# bridge can't answer remotely (a native AskUserQuestion menu, a trust-folder
+# dialog, an ssh passphrase). The context loop watches ONLY bridged panes for
+# these, and after wedge_dwell_seconds send-keys Escape to cancel (Esc only ever
+# cancels, never approves — safe to do blind) and tells the owner. In-memory so a
+# router restart re-arms a clean episode. Replaces the old standalone watchdog.
+_wedge_state = {}
 
 
 def start_caffeinate():
@@ -879,6 +889,111 @@ def _reclaim_stale_locks(reg, tkey, poll_ttl, handoff_ttl):
         pass
 
 
+# --- wedge detection (folded in from the retired standalone watchdog) -------
+#
+# A bridged session can block on a native prompt the bridge can't answer over
+# Telegram: a native AskUserQuestion menu (renders as a "❯ 1." selection with an
+# "Esc to cancel" footer), a trust-folder dialog, or an ssh passphrase. The
+# permission hook + `--permission-mode dontAsk` suppress ordinary tool-permission
+# prompts, so these are the residue. When one persists, the drain nudge just
+# buffers behind it — only an outside actor can break the block. The router IS
+# that actor (it already drives panes via send-keys), so it watches ONLY its own
+# bridged panes and, after a dwell, sends Escape (which can only CANCEL, never
+# approve — safe to do blind) and tells the owner. This replaces the old separate
+# polling watchdog, which scanned every pane (incl. the user's own non-bridge
+# sessions), fired too eagerly, and only alerted instead of resolving.
+WEDGE_PROMPT_PATTERNS = [
+    ("native-permission", r"Do you want to proceed\?"),
+    ("edit-permission", r"Do you want to make this edit"),
+    ("create-permission", r"Do you want to create"),
+    ("trust-folder", r"Do you trust the files"),
+    ("ssh-passphrase", r"Enter passphrase"),
+]
+
+
+def detect_wedge(text):
+    """Short signature if the pane tail looks like a blocking prompt, else None.
+    Named patterns are specific dialogs; the generic rule catches any Claude Code
+    choice menu (a "❯ 1." option line plus the "Esc to cancel" footer that renders
+    only on a blocking prompt, not the normal input box)."""
+    for name, pat in WEDGE_PROMPT_PATTERNS:
+        if re.search(pat, text):
+            return name
+    if "Esc to cancel" in text and re.search(r"❯\s*1\.", text):
+        return "selection-prompt"
+    return None
+
+
+def wedge_excerpt(text):
+    """One-line human hint of what the stuck prompt is asking."""
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line or line.startswith("❯") or line.startswith("Esc to cancel"):
+            continue
+        if re.match(r"\d+\.\s", line):
+            continue
+        return line[:120]
+    return "(prompt)"
+
+
+def handle_wedge(reg, tkey, chat_id, dwell_s):
+    """Detect + auto-clear a wedged BRIDGED session. Called per topic from the
+    context loop. Only ever sends Escape (cancel), never an approval keystroke.
+
+    Skips a topic with a permission already in flight to the phone (the hook owns
+    it by design, not a wedge) and a session whose pane can't be resolved (dead
+    process — a reaping concern, not a wedge)."""
+    cpid = reg.get("claude_pid")
+    thread_id = reg.get("thread_id")
+    if not cpid or thread_id is None:
+        return
+    if (INBOX_ROOT / tkey / "perm-pending.json").exists():
+        _wedge_state.pop(tkey, None)
+        return
+    pane = _pane_for_claude_pid(int(cpid))
+    if not pane:
+        _wedge_state.pop(tkey, None)
+        return
+    tail = _tmux("capture-pane", "-p", "-t", pane)
+    sig = detect_wedge(tail)
+    if sig is None:
+        _wedge_state.pop(tkey, None)   # recovered or never wedged
+        return
+    prev = _wedge_state.get(tkey)
+    now = time.monotonic()
+    if prev is None or prev.get("sig") != sig:
+        _wedge_state[tkey] = {"sig": sig, "first_seen": now, "acted": False}
+        return
+    if prev.get("acted"):
+        return
+    if (now - prev.get("first_seen", now)) < dwell_s:
+        return
+    # Ripe wedge: cancel it (Esc), tell the session why, ping the owner.
+    excerpt = wedge_excerpt(tail)
+    mins = int((now - prev["first_seen"]) // 60)
+    _tmux("send-keys", "-t", pane, "Escape")
+    prev["acted"] = True
+    _wedge_state[tkey] = prev
+    log("wedge: cancelled topic {} pane {} sig={} dwell~{}m: {}".format(
+        thread_id, pane, sig, mins, excerpt))
+    inject_inbox_note(
+        reg,
+        "[bridge] A native '{}' prompt was auto-cancelled (Esc) — the bridge "
+        "can't answer native prompts over Telegram. If you need owner input, ASK "
+        "in this topic (telegram-send.sh), don't open a native prompt. Otherwise "
+        "retry or take another approach.".format(sig),
+        from_id=0, username="bridge")
+    wake_session(reg)
+    if chat_id is not None:
+        send_message(
+            chat_id,
+            "🪤 Auto-cleared a stuck prompt in this session (~{}m, '{}'):\n  {}\n\n"
+            "It was blocking and couldn't be answered remotely, so I sent Esc to "
+            "cancel it. The session will retry or ask here — reply to steer it."
+            .format(mins, sig, excerpt),
+            thread_id=thread_id)
+
+
 def context_loop():
     """Daemon thread: the router's timing engine, OFF the getUpdates path (a big
     transcript scan or a re-nudge must never stall the message pump). On each
@@ -901,6 +1016,9 @@ def context_loop():
         backstop = max(60, int(cfg.get("backstop_seconds", 300) or 300))
         poll_lock_ttl = max(60, int(cfg.get("poll_lock_ttl_seconds", 1800) or 1800))
         handoff_lock_ttl = max(60, int(cfg.get("handoff_lock_ttl_seconds", 600) or 600))
+        wedge_dwell = max(60, int(cfg.get("wedge_dwell_seconds", 300) or 300))
+        # chat_id (for owner wedge alerts) read once per sweep — cheap small file.
+        sweep_chat_id = load_state().get("chat_id")
         if REGISTRY_DIR.is_dir():
             for f in REGISTRY_DIR.glob("*.json"):
                 tkey = f.stem
@@ -934,6 +1052,11 @@ def context_loop():
                 elif undrained_count(reg) > 0 and not lock.exists():
                     if (time.monotonic() - _backstop_nudged_at.get(tkey, 0.0)) >= backstop:
                         wake_session(reg)
+                # Wedge watch: auto-clear a native prompt the bridge can't answer
+                # remotely. Skip mid-handoff (a compaction legitimately drives the
+                # pane and may transiently look like a prompt).
+                if not lock.exists():
+                    handle_wedge(reg, tkey, sweep_chat_id, wedge_dwell)
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:
