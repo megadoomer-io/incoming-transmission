@@ -726,8 +726,9 @@ def wake_session(reg):
     away can still drain from the nudge alone."""
     thread_id = reg.get("thread_id")
     nudge = ("TELEGRAM WAKE {tid}: a message arrived. DRAIN INBOX now (section A of your "
-             "bridge procedure): mkdir SESS/poll.lock.d, read lines after SESS/read.offset, "
-             "reply to each, write the new line count to SESS/read.offset, rmdir the lock. "
+             "bridge procedure): run `~/.telegram-bridge/telegram-inbox.sh drain {tid}`, "
+             "reply to each printed line via telegram-send.sh, then "
+             "`~/.telegram-bridge/telegram-inbox.sh ack {tid}`. "
              "The router owns timing and your context gauge — you have no cron.").format(tid=thread_id)
     _nudge_pane(reg, nudge, "wake")
     # Throttle the backstop: record this attempt regardless of whether a pane was
@@ -872,6 +873,46 @@ def context_loop():
         while _running and slept < interval:
             time.sleep(1)
             slept += 1
+
+
+# --- rich permission round-trip --------------------------------------------
+#
+# The in-session permission hook writes perm-pending.json and polls
+# perm-answer.json. We translate a button tap or a typed reply into that answer
+# file. The owner's free-text note/redirect is delivered to the model via the
+# TRUSTED inbox (a spawned model distrusts hook-injected text), while the
+# allow/deny DECISION rides perm-answer.json to unblock the hook.
+PERM_APPROVE = {"y", "yes", "ok", "okay", "approve", "approved", "allow", "go", "yep", "sure"}
+PERM_DENY = {"n", "no", "deny", "denied", "reject", "stop", "nope"}
+PERM_ALWAYS = {"always", "always-allow", "alwaysallow"}
+
+
+def write_perm_answer(session_dir, decision, note=None):
+    """Hand the hook its decision (and whether a note was sent)."""
+    try:
+        rec = {"decision": decision, "ts": now_iso()}
+        if note:
+            rec["note"] = note
+        (session_dir / "perm-answer.json").write_text(json.dumps(rec))
+        return True
+    except OSError as e:
+        log("ERROR perm-answer write: {}".format(e))
+        return False
+
+
+def inject_inbox_note(reg, text, from_id, username):
+    """Deliver the owner's note/redirect as a TRUSTED inbox message the session
+    drains once the gated tool resolves (the hook only carries the decision)."""
+    try:
+        inbox = Path(reg["inbox_path"])
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        with inbox.open("a") as fh:
+            fh.write(json.dumps({"ts": now_iso(), "from": from_id,
+                                 "username": username, "text": text}) + "\n")
+        return True
+    except OSError as e:
+        log("ERROR inbox note inject: {}".format(e))
+        return False
 
 
 def handle_message(msg, state):
@@ -1029,6 +1070,56 @@ def handle_message(msg, state):
         except OSError as e:
             log("ERROR auq typed-reply write: {}; falling back to inbox".format(e))
 
+    # A permission round-trip in progress for this topic? A typed reply is the
+    # DECISION (not a task): route it to perm-answer.json the hook polls. The
+    # owner's free-text rides the trusted inbox; the bare verb rides the answer.
+    perm_pending = inbox.parent / "perm-pending.json"
+    if text and not image_file_id and perm_pending.exists():
+        session_dir = inbox.parent
+        try:
+            pend = json.loads(perm_pending.read_text())
+        except (OSError, ValueError):
+            pend = {}
+        armed = pend.get("armed") or None
+        if armed and armed.get("decision"):
+            # Second step of an ✍️ button: this whole line is the note/redirect.
+            inject_inbox_note(reg, text, from_id, username)
+            write_perm_answer(session_dir, armed["decision"], note=text)
+            react_eyes(chat_id, message_id)
+            record_msg_thread(message_id, tkey)
+            # Nudge a drain so the session reads the note right after the tool
+            # resolves (else it waits on the backstop). Best-effort, like a message.
+            wake_session(reg)
+            log("perm armed-note ({}) -> topic {} ({})".format(
+                armed["decision"], tkey, reg.get("cwd")))
+            return
+        # Bare typed reply: first token is the verb, the rest (if any) is the note.
+        bits = text.split(maxsplit=1)
+        head = bits[0].strip().lower()
+        rest = bits[1].strip() if len(bits) > 1 else ""
+        if head in PERM_ALWAYS:
+            write_perm_answer(session_dir, "always")
+            react_eyes(chat_id, message_id)
+            record_msg_thread(message_id, tkey)
+            return
+        if head in PERM_APPROVE or head in PERM_DENY:
+            decision = "allow" if head in PERM_APPROVE else "deny"
+            if rest:
+                inject_inbox_note(reg, rest, from_id, username)
+            write_perm_answer(session_dir, decision, note=rest or None)
+            react_eyes(chat_id, message_id)
+            record_msg_thread(message_id, tkey)
+            if rest:
+                wake_session(reg)   # surface the note promptly (see armed branch)
+            log("perm typed {} -> topic {} ({})".format(decision, tkey, reg.get("cwd")))
+            return
+        # Unreadable as a decision: re-prompt, keep waiting (pending stays set).
+        send_message(chat_id,
+                     "🤔 Reply y / n (optionally \"y also do X\" or \"n do this instead\"), "
+                     "or tap a button above.",
+                     thread_id=thread_id, reply_to=message_id)
+        return
+
     image_path = None
     if image_file_id:
         image_path = download_file(image_file_id, inbox.parent / "images", str(message_id))
@@ -1111,10 +1202,13 @@ def handle_reaction(mr, state):
 
 
 def handle_callback(cq, state):
-    """An inline button was tapped. Four callback_data namespaces converge here:
+    """An inline button was tapped. Several callback_data namespaces converge here:
 
-      tg:<y|n>:<thread>            permission Approve/Deny -> synthetic y/n inbox
-                                   line the in-session permission hook polls.
+      perm:<kind>:<thread>         permission decision the in-session hook polls via
+                                   perm-answer.json. kind: y=approve, n=deny,
+                                   a=always-allow, ym=approve+note, nm=deny+redirect
+                                   (the two +note kinds ARM perm-pending so the next
+                                   typed line becomes the note/redirect).
       auq:<thread>:<qidx>:<oidx>   single-select AUQ choice -> auq-answer.json the
                                    MCP server polls.
       auqm:<thread>:<qidx>:<oidx>  multi-select toggle -> flip the option in
@@ -1146,28 +1240,50 @@ def handle_callback(cq, state):
             return None, None
         return reg, Path(reg["inbox_path"]).parent
 
-    # --- permission Approve/Deny: synthetic y/n line the hook polls ---
-    if kind == "tg" and len(parts) == 3:
-        decision, tkey = parts[1], parts[2]
-        reg, _ = resolve(tkey)
+    # --- permission decision -> perm-answer.json the in-session hook polls ---
+    if kind == "perm" and len(parts) == 3:
+        pkind, tkey = parts[1], parts[2]
+        reg, session_dir = resolve(tkey)
         if reg is None:
             answer_callback(cq_id, "Session is gone")
             clear_buttons(chat_id, message_id)
             return
-        answer = "y" if decision == "y" else "n"
-        try:
-            with Path(reg["inbox_path"]).open("a") as fh:
-                fh.write(json.dumps({
-                    "ts": now_iso(), "message_id": message_id, "from": from_id,
-                    "username": frm.get("username"), "text": answer,
-                    "via": "callback"}) + "\n")
-        except OSError as e:
-            log("ERROR callback write: {}".format(e))
+        if pkind in ("ym", "nm"):
+            # Arm: the NEXT typed message becomes the note/redirect; don't decide yet.
+            decision = "allow" if pkind == "ym" else "deny"
+            pending_file = session_dir / "perm-pending.json"
+            try:
+                pend = json.loads(pending_file.read_text())
+            except (OSError, ValueError):
+                pend = {}
+            pend["armed"] = {"decision": decision}
+            try:
+                pending_file.write_text(json.dumps(pend))
+            except OSError as e:
+                log("ERROR perm arm write: {}".format(e))
+                answer_callback(cq_id, "Error")
+                return
+            answer_callback(cq_id, "Send your note as the next message")
+            send_message(chat_id,
+                         "✍️ Approve + note: send your note as the next message — "
+                         "it runs, then the session reads your note."
+                         if decision == "allow" else
+                         "✍️ Deny + redirect: send what to do instead as the next message.",
+                         thread_id=reg.get("thread_id"))
+            clear_buttons(chat_id, message_id)
+            log("callback perm:{} (arm) -> topic {} ({})".format(pkind, tkey, reg.get("cwd")))
+            return
+        decision = {"y": "allow", "a": "always", "n": "deny"}.get(pkind)
+        if decision is None:
+            answer_callback(cq_id)
+            return
+        if not write_perm_answer(session_dir, decision):
             answer_callback(cq_id, "Error")
             return
-        answer_callback(cq_id, "Approved ✅" if decision == "y" else "Denied ⛔")
+        answer_callback(cq_id, {"allow": "Approved ✅", "always": "Always allowed ✅",
+                                "deny": "Denied ⛔"}[decision])
         clear_buttons(chat_id, message_id)
-        log("callback {} (tg) -> topic {} ({})".format(answer, tkey, reg.get("cwd")))
+        log("callback perm:{} -> topic {} ({})".format(pkind, tkey, reg.get("cwd")))
         return
 
     # --- single-select AUQ tap -> answer file ---

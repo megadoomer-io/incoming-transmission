@@ -80,26 +80,29 @@ detection is ever down.
 
 ## Tier-2 permission approval
 
-Optional, and only for unattended `/new` spawns running `spawned_mode: "ask"`. An
-unattended session can't show a local permission prompt — it would hang the detached
-pane — so the decision goes to your phone as tappable buttons.
+Applies to **every bridge session** — a `/new` spawn or a `/telegram`-attached
+session alike — under the default `spawned_mode: "risk-tiered"`. A dangerous tool
+call goes to your topic as tappable buttons rather than a local prompt (uniform
+whether or not someone is at the pane).
 
 ![Permission approval](diagrams/permission-approval.svg)
 
 <!-- Source: diagrams/permission-approval.dot — regenerate with `make diagrams` -->
 
-`telegram-permission-hook.py` is a PreToolUse hook gated on
-`TELEGRAM_BRIDGE_SPAWNED=1`, so it's an instant no-op for every normal session. For
-a spawned session it routes `Write` / `Edit` / `NotebookEdit` / `WebFetch` and any
-non-allowlisted `mcp__*` tool to the topic with Approve / Deny buttons, blocking
-until you answer (auto-deny after 240s). MCP tools already on your
-`settings.json` / `settings.local.json` allowlist are allowed by the hook directly
-(no round-trip); a tapped button is delivered by the router as a synthetic `y`/`n`
-line into the inbox, which the blocked hook consumes exactly like a typed reply.
+`telegram-permission-hook.py` is a PreToolUse hook registered in
+`~/.claude/settings.json` (**NOT** `settings.local.json` — Claude Code ignores
+`.local` hooks in spawned/headless sessions). It self-scopes to bridge sessions
+(resolves the topic from the registry by cwd; instant no-op otherwise), and routes
+`Write` / `Edit` / `NotebookEdit`, **risky** Bash, and any non-allowlisted `mcp__*`
+to the topic with **Approve / Always allow / Approve+note / Deny / Deny+redirect**
+buttons, blocking until you answer (auto-deny after ~28 min). A hook `deny` overrides
+even a broad `Bash(*)` allow. Decisions ride a `perm-pending.json` /
+`perm-answer.json` side channel (the router translates a tap or typed reply into the
+answer file); the owner's free-text note/redirect is delivered to the session via the
+trusted inbox.
 
-> The shipped default is `spawned_mode: "auto-allow"` (fully autonomous, no approval
-> round-trip). The tap-to-approve flow above only happens when you set
-> `spawned_mode: "ask"`. See [Known issues](../README.md#known-issues).
+> The default is `spawned_mode: "risk-tiered"`; `auto-allow` (fully autonomous, no
+> round-trip) is opt-in. The gate is bridge-membership, not how the session started.
 
 ## Regenerating the diagrams
 

@@ -438,47 +438,53 @@ Key design points:
   `telegram-spawn.sh` injects `TELEGRAM_BRIDGE_BOT_TOKEN`, `PATH`, `HOME`, and
   `TELEGRAM_BRIDGE_SPAWNED=1` into the pane.
 
-## Permissions in spawned sessions (Tier 2)
+## Permissions in bridge sessions (Tier 2)
 
-> **⚠️ The shipped default is `spawned_mode: "auto-allow"` — fully autonomous, NO
-> approval round-trip.** In that mode a spawned session auto-runs gated tools
-> (Write/Edit/MCP) and answers its own questions; nothing is sent to your phone for
-> approval. A message you send can drive a session that edits files and runs tools
-> with no tap-to-approve gate. The tap-to-approve flow described below only happens
-> when you set `spawned_mode: "ask"` in `~/.telegram-bridge/permissions.json`.
-> Whether `auto-allow` should be the default is a pending decision (see the
-> KNOWN ISSUES note in the README) — it ships this way because the approval
-> round-trip is not yet end-to-end tested.
+Every bridge session — a `/new` spawn OR a `/telegram`-attached session — runs the
+SAME permission gate, so the experience never depends on how the session started.
+`telegram-permission-hook.py` is a PreToolUse hook registered in
+`~/.claude/settings.json` (**NOT** `settings.local.json` — Claude Code doesn't load
+`.local` hooks in spawned/headless sessions) with matcher
+`Write|Edit|NotebookEdit|Bash|mcp__.*`. It self-scopes to bridge sessions: it
+resolves this session's topic from the registry by cwd and abstains instantly in any
+non-bridge session, so it is a no-op everywhere else.
 
-With `spawned_mode: "ask"`: a spawned session runs unattended, so a local permission
-prompt would hang the pane. `telegram-permission-hook.py` (a PreToolUse hook wired in
-`~/.claude/settings.local.json`, NOT the shared `settings.json`) routes approval
-requests for `Write`/`Edit`/`NotebookEdit`/`WebFetch` and any non-allowlisted
-MCP tool (`mcp__*`) to the session's topic: it posts the change preview with
-inline **Approve / Deny** buttons (one tap on the phone; a typed `y`/`n` still
-works as a fallback), blocks until you answer (auto-deny after 240s), then allows
-or denies. Bash and reads are already covered by the `Bash(*)` allowlist with GIR
-as the floor, so they don't prompt.
+Posture is `spawned_mode` in `~/.telegram-bridge/permissions.json` (read live):
 
-MCP coverage reuses your existing settings allowlist as the single source of
-truth. The hook reads the `mcp__*` allow entries from `~/.claude/settings.json`
-and `settings.local.json`; an allowlisted MCP tool (e.g.
-`mcp__plugin_github_github__*`) is **explicitly allowed by the hook**, and only
-the non-allowlisted ones get routed to Telegram. (The hook does not rely on
-Claude Code's own permission flow to auto-allow them: in a spawned session an
-allowlisted MCP tool like `mcp__telegram__AskUserQuestion` still hit the native
-permission prompt, which hangs a detached pane, so the hook returns the allow
-decision itself.) Project-level
-`.claude/settings*.json` are deliberately ignored — a checked-in repo allowlist
-must not silently widen what an unattended session can run.
+- **`risk-tiered`** (default) — route the dangerous set to the owner over Telegram;
+  floor everything else. Dangerous = `Write`/`Edit`/`NotebookEdit`, **risky** Bash
+  (`rm -rf`, force-push, `kubectl delete`, `drop table`, `curl … | sh`, …), and any
+  non-allowlisted `mcp__*`. Safe Bash and reads run via the engine's allowlist.
+- **`ask`** — alias of `risk-tiered` for now.
+- **`auto-allow`** — fully autonomous: gated tools auto-run and AskUserQuestion is
+  auto-denied so the model self-decides. No round-trip. Opt-in.
 
-The hook is gated on `TELEGRAM_BRIDGE_SPAWNED=1` and a
-`Write|Edit|NotebookEdit|WebFetch|mcp__.*` matcher — it is a no-op (instant exit
-0) for every normal session. It reuses the registry (cwd→topic), `state.json`
-(chat_id), and the session inbox for the round-trip; a tapped Approve/Deny button
-is delivered by the router (via `callback_query`) as a synthetic `y`/`n` line into
-that inbox, which the blocked hook consumes exactly like a typed reply. While it
-blocks, the session is busy so a drain nudge won't contend.
+The round-trip (risk-tiered/ask): the hook posts the change preview to the topic
+with inline buttons — **✅ Approve**, **✅ Always allow**, **✍️ Approve + note**,
+**⛔ Deny**, **✍️ Deny + redirect** — and blocks until you answer (auto-deny after
+~28 min; the hook's `timeout` in settings.json is 30 min). A typed reply also works:
+`y` / `n`, or `y <note>` / `n <do this instead>`; unreadable input is re-prompted.
+
+- **Approve / Deny** → allow / deny the one call.
+- **Always allow** → allow AND persist a NARROW native rule (e.g. `Write(/abs/path)`,
+  `Bash(git push:*)`, the exact `mcp__server__tool`) into
+  `~/.telegram-bridge/spawned-allow.json` so the same call won't ask again. Never a
+  wildcard; if a safe narrow rule can't be formed it degrades to allow-once. The hook
+  reads that file live, so the rule takes effect immediately.
+- **Approve + note / Deny + redirect** → your free-text is delivered to the session
+  as a TRUSTED inbox message (a spawned model distrusts hook-injected text, so the
+  note rides the normal chat channel); the hook's decision carries only a short
+  "read your inbox" pointer.
+
+Mechanism: the hook writes `perm-pending.json` and polls `perm-answer.json` in the
+session dir (mirroring the AUQ MCP's pending/answer files). The router translates a
+button tap or typed reply into `perm-answer.json` (the two `✍️` buttons arm
+`perm-pending` so the next typed line becomes the note). MCP coverage reuses your
+`mcp__*` allowlist from `~/.claude/settings.json` + `settings.local.json` (project
+settings ignored — a checked-in repo allowlist must not widen an unattended session).
+A hook `deny` overrides even a broad `Bash(*)` allow, which is how risky Bash is
+gated despite a global Bash allowlist. (NOTE: the gate is bridge-MEMBERSHIP, not
+`TELEGRAM_BRIDGE_SPAWNED`; that env var only marks the launch path.)
 
 ## Known Limitations
 
@@ -505,13 +511,14 @@ blocks, the session is busy so a drain nudge won't contend.
   formatting (HTML/code blocks) is a later enhancement.
 - **Unattached topics**: messages to a topic with no attached session get a "no
   session" reply. Use `/new` to spawn a fresh attached session.
-- **Tier-2 coverage**: `Write`/`Edit`/`NotebookEdit`/`WebFetch` and any
-  non-allowlisted `mcp__*` tool route to Telegram for approval. Allowlisted MCP
-  tools auto-run without a round-trip. A non-MCP tool outside the `Bash(*)` /
-  read allowlist (rare) would still prompt and hang.
-- **Spawn reply consumption**: the permission hook treats the next inbox message
-  as the y/n answer and advances `read.offset` past it. A task message sent in
-  the narrow window while an approval is pending is consumed as the answer.
+- **Tier-2 coverage**: `Write`/`Edit`/`NotebookEdit`, **risky** Bash, and any
+  non-allowlisted `mcp__*` route to Telegram for approval. Safe Bash, reads, and
+  allowlisted MCP run via the engine. WebFetch is not gated by the hook (an
+  allowlisted domain runs; a non-allowlisted one is auto-denied by `dontAsk` in spawns).
+- **Typed replies during a pending approval are the answer**: while a permission
+  prompt is open, a typed message is routed to `perm-answer.json` (interpreted as the
+  decision or note), not the task inbox. Tap the buttons, or send your task after
+  answering.
 - **Handoff window retirement is tmux-only**: the `DEAD - <name>` rename / kill on
   compaction applies to spawned sessions (which run in the shared `claude` tmux
   session). A manually-attached session in a plain terminal still saves, spawns the

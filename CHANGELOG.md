@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased — risk-tiered permissions (Tier 2)
+
+The Tier-2 permission gate now works for real and applies uniformly to **every**
+bridge session. Previously it was effectively dead code: spawns launched with
+`--dangerously-skip-permissions`, under which the hook's decisions never fired, so
+`auto-allow` was the de-facto behavior by accident.
+
+### Added
+- **Risk-tiered permission round-trip (the new default).** Dangerous tool calls —
+  `Write`/`Edit`/`NotebookEdit`, **risky** Bash (`rm -rf`, force-push, `kubectl
+  delete`, `drop table`, `curl … | sh`, …), and any non-allowlisted `mcp__*` — are
+  routed to the owner's Telegram topic for tap-to-approve; safe Bash, reads, and
+  allowlisted tools run untouched. (`telegram-permission-hook.py`.)
+- **Rich answers.** Inline buttons: ✅ Approve · ✅ Always allow · ✍️ Approve + note ·
+  ⛔ Deny · ✍️ Deny + redirect — plus typed `y`/`n` and `y <note>` / `n <redirect>`.
+  The owner's free-text note/redirect is delivered to the session as a **trusted
+  inbox message** (a spawned model distrusts hook-injected text), with the hook's
+  decision carrying only a "read your inbox" pointer. (`telegram-router.py`.)
+- **Persisted "always allow" rules.** ✅ Always allow writes a NARROW native rule
+  (e.g. `Write(/abs/path)`, `Bash(git push:*)`, exact `mcp__server__tool`; never a
+  wildcard) to `~/.telegram-bridge/spawned-allow.json`, read live by the hook so the
+  same call won't ask again. Auditable, editable plain JSON.
+
+### Changed
+- **Spawns launch with `--permission-mode dontAsk`** instead of
+  `--dangerously-skip-permissions`. In dontAsk a tool the hook doesn't allow is
+  auto-denied (never a hanging prompt); a hook `allow` runs it; a hook `deny`
+  overrides even a broad `Bash(*)` allow (CC ≥ 2.1.178). (`telegram-spawn.sh`.)
+- **Default `spawned_mode` is now `risk-tiered`** (was `auto-allow`). `auto-allow`
+  (fully autonomous, no round-trip) is opt-in. (`runtime/permissions.json`.)
+- **The gate is bridge-MEMBERSHIP, not launch path.** A `/new` spawn and a
+  `/telegram`-attached session gate identically — the hook keys off the session's
+  topic in the registry, not `TELEGRAM_BRIDGE_SPAWNED`.
+- **Register the hook in `settings.json`, not `settings.local.json`** — CC does not
+  load `.local` PreToolUse hooks in spawned/headless sessions. Matcher
+  `Write|Edit|NotebookEdit|Bash|mcp__.*`. (README / SKILL wiring updated.)
+- **Approval wait raised to ~28 min** (hook `timeout` 30 min) so the owner can be
+  away from their phone. (Was 240s.)
+
+### Fixed
+- **`claude --settings <file>` silently dropped the user's hooks.** The spawn used
+  it to load persisted allow-rules, which disabled the very permission hook. Removed;
+  the hook reads `spawned-allow.json` directly instead. (`telegram-spawn.sh`.)
+- **tmux session-env leak.** `TELEGRAM_BRIDGE_SPAWNED` and the bot token were set via
+  `tmux new-session -e`, which is session-scoped — so every window opened in the
+  shared `claude` tmux session inherited them, making attended sessions gate (and
+  exposing the token). Now passed via the `/usr/bin/env` command wrapper
+  (process-scoped). (`telegram-spawn.sh`.)
+- **"Always allow" could persist a bogus rule.** A mis-parsed command skeleton (e.g.
+  a numeric first token) produced rules like `Bash(1680:*)`; the skeleton extractor
+  now rejects non-command-shaped tokens and degrades to allow-once.
+
 ## Unreleased — review-fix pass (agnostic transport)
 
 Implements an outside review's "do-now" set. The throughline: make

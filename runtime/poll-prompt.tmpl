@@ -21,22 +21,14 @@ follow it for every reply this session (ignore #-comment lines; if empty, reply 
 normal formatting).
 
 A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
-   1. Take a non-blocking per-topic lock so a push drain and a backstop re-nudge
-      (or a compaction cutover) can't double-reply. Atomic mkdir lock (flock is
-      NOT on macOS, do not use it):
-        mkdir SESS/poll.lock.d 2>/dev/null || (lock held -> self-heal or stop)
-      If the mkdir fails the lock is held. Self-heal a STALE lock (a drain that
-      died before releasing): if SESS/poll.lock.d is older than poll_lock_ttl_seconds
-      (~/.telegram-bridge/compaction.json, default 1800), rmdir it and retry the
-      mkdir once; otherwise a live drain owns it -> stop. The dir's own mtime is the
-      acquire time, so no owner file is needed:
-        ttl=$(jq -r '.poll_lock_ttl_seconds // 1800' ~/.telegram-bridge/compaction.json 2>/dev/null || echo 1800)
-        find SESS/poll.lock.d -maxdepth 0 -mmin +$((ttl/60)) >/dev/null 2>&1 \
-          && rmdir SESS/poll.lock.d && mkdir SESS/poll.lock.d   # reclaim only if stale
-      Hold it for steps 2-4; ALWAYS rmdir it when done (even on no messages).
-   2. Read read-offset from SESS/read.offset (default 0). Read {{INBOX}}; take the
-      lines AFTER it. DRAINED = number of new lines (0 if none).
-   3. For each new inbox line (JSON). A line is a task/question, an image, a
+   1. Read your new messages with ONE whitelistable command. It takes the per-topic
+      lock (reclaiming a stale one past poll_lock_ttl_seconds), prints the new inbox
+      lines (JSON, one per line) after read.offset, and records the pending offset —
+      it does NOT advance the offset or release the lock yet:
+        ~/.telegram-bridge/telegram-inbox.sh drain {{THREAD_ID}}
+      If it exits non-zero printing "LOCKED", a live drain/cutover holds the lock —
+      stop. If it prints no lines, there's no backlog — skip to the ack in step 3.
+   2. For each printed line (JSON). A line is a task/question, an image, a
       reaction signal, or a bridge command. Dispatch by shape:
       a. "type":"reaction" present -> INFORMATIONAL signal, NOT a task. The owner
          added/removed an emoji on one of your messages (fields: emoji, action
@@ -65,11 +57,21 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
          /review, ...) is NOT a bridge command — treat it as a task so skills can be
          driven from the phone. (Daemon-level /new, /whoami, /sessions, /help never
          reach the inbox.)
-   4. Write the new line count to SESS/read.offset. Release the lock: rmdir SESS/poll.lock.d.
-   5. If DRAINED > 0, report briefly (e.g. "telegram: replied to 1 message").
+   4. When you've processed + replied to EVERY printed line, commit the offset and
+      release the lock with ONE command:
+        ~/.telegram-bridge/telegram-inbox.sh ack {{THREAD_ID}}
+      If the session dies between drain and ack, the offset isn't advanced and the
+      lock goes stale -> the lines are re-drained next cycle. No message is lost.
+   5. If you processed > 0 messages, report briefly (e.g. "telegram: replied to 1 message").
+
+   WHY two fixed commands (not ad-hoc bash): the drain mechanics now run through one
+   ALLOWLISTABLE command set — Bash(~/.telegram-bridge/telegram-inbox.sh:*) and
+   Bash(~/.telegram-bridge/telegram-send.sh:*) — instead of per-call mkdir/tail/echo/
+   rmdir whose $(...) / variable expansion dodges the allowlist and prompts the owner.
+   Keep using literal values (the IDs above are baked in); avoid shell variables.
 
 B. COMPACTION — the ROUTER detects the context trigger, not you. When it sees your
-   gauge cross trigger_pct it delivers a reserved `/compact` (drained in A.3.e
+   gauge cross trigger_pct it delivers a reserved `/compact` (drained in A.2.e
    above, or as a direct wake nudge). You do NOT self-check pct. Run COMPACTION
    HANDOFF below whenever you receive /compact. (Claude Code's native auto-compact
    remains the ultimate backstop if the router's detection is ever down.)

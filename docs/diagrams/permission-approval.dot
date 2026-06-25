@@ -1,7 +1,8 @@
-// Tier-2 Permission Approval (spawned_mode: "ask")
-// An unattended spawn can't show a local permission prompt — it would hang the
-// pane. The PreToolUse hook routes the decision to the topic as tappable buttons
-// and blocks until you answer (or auto-denies). Only fires for spawned sessions.
+// Tier-2 Permission Approval (spawned_mode: "risk-tiered", the default)
+// Applies to EVERY bridge session — a /new spawn or a /telegram-attached session
+// alike. A dangerous tool call is routed to the topic as tappable buttons; the hook
+// blocks until you answer (or auto-denies after ~28 min). The gate is
+// bridge-MEMBERSHIP (the session's topic, resolved by cwd), not how it started.
 //
 // Render: dot -Tsvg permission-approval.dot -o permission-approval.svg
 
@@ -11,30 +12,34 @@ digraph permission_approval {
     node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
     edge [fontname="Helvetica", fontsize=9];
 
-    tool   [label="spawned session calls a gated tool\nWrite / Edit / NotebookEdit / WebFetch /\nnon-allowlisted mcp__*"];
-    hook   [label="PreToolUse: telegram-permission-hook.py\n(gated on TELEGRAM_BRIDGE_SPAWNED=1)", fillcolor="#fffde7"];
+    tool      [label="session calls a tool"];
+    hook      [label="PreToolUse: telegram-permission-hook.py\n(settings.json; matcher Write|Edit|NotebookEdit|Bash|mcp__.*)", fillcolor="#fffde7"];
 
-    spawned[label="spawned session?", shape=diamond, fillcolor="#fffde7"];
-    allowl [label="MCP tool allowlisted in\nsettings.json / .local.json?", shape=diamond, fillcolor="#fffde7"];
-    noop   [label="no-op: instant exit 0\n(normal sessions never prompt)", fillcolor="#e6f4ea"];
-    autoallow[label="hook returns allow itself\n(skips native prompt)", fillcolor="#e6f4ea"];
+    bridge    [label="bridge session?\n(topic resolves by cwd)", shape=diamond, fillcolor="#fffde7"];
+    noop      [label="abstain: instant exit 0\n(non-bridge sessions untouched)", fillcolor="#e6f4ea"];
 
-    post   [label="post preview to topic\nwith Approve / Deny buttons", fillcolor="#e8f0fe", color="#1a73e8"];
-    block  [label="hook BLOCKS\n(auto-deny after 240s)"];
-    tap    [label="you tap a button\n(or type y / n)"];
-    cb     [label="router: callback_query →\nsynthetic y/n line into inbox"];
-    consume[label="hook consumes the line\n(like a typed reply)"];
+    gated     [label="dangerous?\nWrite / Edit / NotebookEdit,\nrisky Bash, non-allowlisted mcp__*", shape=diamond, fillcolor="#fffde7"];
+    floor     [label="abstain → engine floor\n(safe Bash, reads, allowlisted MCP run)", fillcolor="#e6f4ea"];
 
-    decide [label="approved?", shape=diamond, fillcolor="#fffde7"];
-    allow  [label="allow → tool runs", fillcolor="#e6f4ea"];
-    deny   [label="deny → tool blocked", fillcolor="#ffe0e0"];
+    persisted [label="covered by a persisted\nalways-allow rule?", shape=diamond, fillcolor="#fffde7"];
+    allowrule [label="allow (no round-trip)", fillcolor="#e6f4ea"];
 
-    tool -> hook -> spawned;
-    spawned -> noop      [label="no"];
-    spawned -> allowl    [label="yes"];
-    allowl -> autoallow  [label="yes"];
-    allowl -> post       [label="no"];
-    post -> block -> tap -> cb -> consume -> decide;
-    decide -> allow [label="yes"];
-    decide -> deny  [label="no / timeout"];
+    post      [label="post preview to topic — buttons:\nApprove · Always allow · Approve+note\nDeny · Deny+redirect", fillcolor="#e8f0fe", color="#1a73e8"];
+    block     [label="hook BLOCKS on perm-answer.json\n(auto-deny after ~28 min)"];
+    answer    [label="you tap / type; router writes\nperm-answer.json (note → inbox)"];
+
+    decide    [label="decision", shape=diamond, fillcolor="#fffde7"];
+    allow     [label="allow → tool runs\n(Always allow: persist a narrow rule)", fillcolor="#e6f4ea"];
+    deny      [label="deny → tool blocked\n(redirect note → inbox)", fillcolor="#ffe0e0"];
+
+    tool -> hook -> bridge;
+    bridge -> noop      [label="no"];
+    bridge -> gated     [label="yes"];
+    gated -> floor      [label="no"];
+    gated -> persisted  [label="yes"];
+    persisted -> allowrule [label="yes"];
+    persisted -> post      [label="no"];
+    post -> block -> answer -> decide;
+    decide -> allow [label="approve /\nalways allow"];
+    decide -> deny  [label="deny / timeout"];
 }
