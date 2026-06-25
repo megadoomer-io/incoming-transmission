@@ -902,24 +902,30 @@ def _reclaim_stale_locks(reg, tkey, poll_ttl, handoff_ttl):
 # approve — safe to do blind) and tells the owner. This replaces the old separate
 # polling watchdog, which scanned every pane (incl. the user's own non-bridge
 # sessions), fired too eagerly, and only alerted instead of resolving.
-WEDGE_PROMPT_PATTERNS = [
-    ("native-permission", r"Do you want to proceed\?"),
-    ("edit-permission", r"Do you want to make this edit"),
-    ("create-permission", r"Do you want to create"),
-    ("trust-folder", r"Do you trust the files"),
-    ("ssh-passphrase", r"Enter passphrase"),
-]
-
-
 def detect_wedge(text):
-    """Short signature if the pane tail looks like a blocking prompt, else None.
-    Named patterns are specific dialogs; the generic rule catches any Claude Code
-    choice menu (a "❯ 1." option line plus the "Esc to cancel" footer that renders
-    only on a blocking prompt, not the normal input box)."""
-    for name, pat in WEDGE_PROMPT_PATTERNS:
-        if re.search(pat, text):
-            return name
-    if "Esc to cancel" in text and re.search(r"❯\s*1\.", text):
+    """Short signature if the pane's LIVE prompt region looks like a blocking
+    prompt the bridge can't answer remotely, else None.
+
+    Only the BOTTOM of the pane (the active prompt area) is inspected, and a match
+    requires the prompt's interactive footer at the very end — not the words merely
+    appearing somewhere. A session that DISPLAYS these strings as content (editing
+    this very file, showing a captured menu, a transcript that quotes "Esc to
+    cancel") must not be flagged and Esc'd — that false positive bit the bridge's
+    own dev session. Requiring the footer near the end is what separates a real
+    live prompt from text sitting in scrollback."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    tail = lines[-12:]
+    last3 = "\n".join(tail[-3:])
+    # ssh/git passphrase: a raw readline prompt on the final line(s).
+    if re.search(r"Enter passphrase|Bad passphrase", last3):
+        return "ssh-passphrase"
+    # Claude Code choice menu (permission / AskUserQuestion / /model / trust-folder):
+    # the cursor ❯ on a numbered option (ANY number — Claude Code points it at the
+    # CURRENTLY-SELECTED option, e.g. `❯ 7.` in /model, not always `❯ 1.`) AND an
+    # "Esc to cancel" footer in the last few lines, where a live prompt renders it.
+    if re.search(r"esc to cancel", last3, re.I) and re.search(r"❯\s*\d+\.", "\n".join(tail)):
         return "selection-prompt"
     return None
 
@@ -983,7 +989,10 @@ def handle_wedge(reg, tkey, chat_id, dwell_s):
         "in this topic (telegram-send.sh), don't open a native prompt. Otherwise "
         "retry or take another approach.".format(sig),
         from_id=0, username="bridge")
-    wake_session(reg)
+    # Do NOT nudge here: send-keys racing the just-sent Esc can land the nudge text
+    # unsent in the input box (the menu is still clearing). The note is non-urgent
+    # context, so let the normal undrained-inbox backstop deliver it on a later
+    # sweep, once the pane has settled.
     if chat_id is not None:
         send_message(
             chat_id,
