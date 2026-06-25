@@ -209,6 +209,21 @@ def _claude_ancestor_pid():
     return None
 
 
+def _pid_alive(pid):
+    """True if the process is alive. os.kill(pid, 0) raises ProcessLookupError if
+    the pid is gone. A dead claude_pid means an ORPHANED registry entry -- a
+    session that died without deregistering (e.g. across a reboot). It must NOT
+    gate a fresh session that merely shares the same cwd, which would route the
+    fresh session's approvals to a Telegram topic no one is watching."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user (same-user here; defensive)
+
+
 def find_topic(cwd):
     """Return (thread_id, session_dir) for THIS session's topic, or None if this
     is not a bridge session.
@@ -230,6 +245,14 @@ def find_topic(cwd):
             continue
         rc = reg.get("cwd")
         if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
+            continue
+        # Skip orphaned entries: a dead claude_pid means the bridged session is
+        # gone (e.g. killed by a reboot without deregistering). Matching it here
+        # would gate a FRESH, unbridged session that merely shares this cwd and
+        # hang it on a Telegram topic no one is watching. Entries with no
+        # claude_pid are kept (older format; can't assess liveness).
+        cp = reg.get("claude_pid")
+        if cp is not None and not _pid_alive(cp):
             continue
         inbox = reg.get("inbox_path") or ""
         session_dir = str(Path(inbox).parent) if inbox else ""
