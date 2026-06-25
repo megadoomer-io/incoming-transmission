@@ -726,8 +726,9 @@ def wake_session(reg):
     away can still drain from the nudge alone."""
     thread_id = reg.get("thread_id")
     nudge = ("TELEGRAM WAKE {tid}: a message arrived. DRAIN INBOX now (section A of your "
-             "bridge procedure): mkdir SESS/poll.lock.d, read lines after SESS/read.offset, "
-             "reply to each, write the new line count to SESS/read.offset, rmdir the lock. "
+             "bridge procedure): run `~/.telegram-bridge/telegram-inbox.sh drain {tid}`, "
+             "reply to each printed line via telegram-send.sh, then "
+             "`~/.telegram-bridge/telegram-inbox.sh ack {tid}`. "
              "The router owns timing and your context gauge — you have no cron.").format(tid=thread_id)
     _nudge_pane(reg, nudge, "wake")
     # Throttle the backstop: record this attempt regardless of whether a pane was

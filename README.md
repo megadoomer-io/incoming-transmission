@@ -171,6 +171,19 @@ the skill):
    > load PreToolUse hooks from `.local` in spawned/headless sessions, so a `.local`
    > registration silently never fires. The hook self-scopes to bridge sessions (it
    > abstains in every non-bridge session), so registering it globally is safe.
+4. **Allowlist the bridge scripts** so the drain procedure runs prompt-free (the
+   session drains via fixed scripts, not ad-hoc bash). Add to `permissions.allow` in
+   `~/.claude/settings.json`:
+   ```json
+   { "permissions": { "allow": [
+       "Bash(~/.telegram-bridge/telegram-inbox.sh:*)",
+       "Bash(~/.telegram-bridge/telegram-send.sh:*)"
+   ] } }
+   ```
+   Each drain is `telegram-inbox.sh drain|ack <thread>` + `telegram-send.sh` replies —
+   a fixed, allowlistable command set instead of per-call bash whose `$(...)` /
+   variable expansion would dodge the allowlist and prompt you on every housekeeping
+   step (especially once the session is gated).
 
 ## Commands
 
