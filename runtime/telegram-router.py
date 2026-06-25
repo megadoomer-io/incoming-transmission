@@ -820,6 +820,31 @@ def _pid_alive(pid):
         return True  # exists, owned by another user (same-user here; defensive)
 
 
+def prune_orphaned_registry():
+    """Delete registry entries whose claude_pid is dead — orphaned by a reboot or
+    a crash that killed the session without deregistering. A lingering dead-pid
+    entry would otherwise let the permission hook mistake a FRESH session sharing
+    that cwd for the (dead) bridged one and gate its tool calls to a Telegram
+    topic no one is watching, hanging the session until the approval times out.
+    Runs once at startup (the reboot case, where every bridged pid is gone); the
+    permission hook's own _pid_alive check is the real-time backstop for entries
+    that go stale between restarts. Entries with no claude_pid are left alone —
+    we can't assess them, and they predate the pid-stamped format."""
+    if not REGISTRY_DIR.is_dir():
+        return
+    for f in REGISTRY_DIR.glob("*.json"):
+        try:
+            cp = json.loads(f.read_text()).get("claude_pid")
+        except (ValueError, OSError):
+            continue
+        if cp is not None and not _pid_alive(cp):
+            try:
+                f.unlink()
+                log("pruned orphaned registry entry {} (dead claude_pid {})".format(f.name, cp))
+            except OSError:
+                pass
+
+
 def _reclaim_stale_locks(reg, tkey, poll_ttl, handoff_ttl):
     """Clear a stale poll.lock.d / compacting.lock so a dead or abandoned drain or
     handoff can't wedge the topic (issue #8, FM1/FM2/FM5). A lock is stale when the
@@ -1493,6 +1518,10 @@ def main():
     REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
     STICKY_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Reap registry entries whose claude_pid died (reboot/crash) so a dead bridge
+    # session never gates a fresh session that happens to share its cwd.
+    prune_orphaned_registry()
 
     state = load_state()
     log("telegram-router up. state_dir={} owner=@{} chat_id={} offset={}".format(
