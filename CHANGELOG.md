@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — router-integrated wedge auto-clear
+
+### Changed
+- **Wedge auto-clear folded into the router; watchdog retired.** Detection of a
+  session stuck on an interactive menu (a "wedge") now lives in the router's
+  `context_loop` instead of a separate `telegram-watchdog.py` daemon + launchd
+  job, both removed. After `wedge_dwell_seconds` on a detected wedge the router
+  sends Escape to the session's pane. Scope is bridged panes only: it never
+  touches a non-bridge session, and it skips a topic that already has a
+  permission pending on the phone. (`telegram-router.py`; removed
+  `telegram-watchdog.py`, `com.telegram.watchdog.plist`, and the watchdog control
+  subcommands.)
+
+### Fixed
+- **Wedge detection is bottom-anchored (no more false positives).** Only the last
+  ~12 pane lines are examined, an "Esc to cancel" footer must appear in the last 3
+  lines, and the cursor must sit on a numbered option — so a session that merely
+  *displays* the menu pattern as content (code, a captured menu) is no longer
+  Escaped. Also dropped a race where a nudge could fire immediately after the Esc.
+  (`telegram-router.py`.)
+- **A dead-pid registry entry never gates a session.** Real-time backstop to the
+  router's startup prune: the permission hook skips registry entries whose
+  `claude_pid` is dead, so even between router restarts an orphaned entry can't
+  hang a fresh session that shares its cwd. (`telegram-permission-hook.py`.)
+
 ## Unreleased — session lifecycle: reaping, /attach, orphan cleanup
 
 ### Added
