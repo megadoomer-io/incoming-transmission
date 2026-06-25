@@ -196,6 +196,18 @@ If `transcript_path` comes out empty (rare — e.g. the SessionStart hook didn't
 the context gauge and auto-compaction simply stay dormant for this topic; everything
 else works. You can re-run this block to backfill it later.
 
+Then **stamp the pane option** so the pane-keyed resolver binds this session by its
+tmux pane (not cwd). Best-effort, via the session's own inherited tmux; harmless if
+not in tmux:
+
+```bash
+[ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @telegram_thread_id "$THREAD_ID" || true
+```
+
+(Migration note: this session-side stamp is the canary step. The eventual design
+stamps the pane programmatically from the spawn/router so binding leaves the LLM
+entirely — see the reconciliation design doc.)
+
 ### Step 3.5: (attach mode only) complete the handoff handshake
 
 **Skip this step entirely unless `TELEGRAM_BRIDGE_ATTACH_THREAD` is set** (normal

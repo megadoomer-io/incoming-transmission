@@ -75,3 +75,91 @@ def test_blank_env_var_is_not_a_binding():
     # Empty/whitespace env var must not be treated as a thread id.
     env = {"TMUX_PANE": "%7", "TELEGRAM_BRIDGE_THREAD_ID": "  "}
     assert bridge_resolve.resolve_topic(env=env, pane_option_reader=_reader({})) is None
+
+
+# --- cwd fallback (migration shim) ------------------------------------------
+
+import json
+import os
+
+
+def _write_reg(regdir, thread_id, cwd, claude_pid=None, registered_at="2026-01-01T00:00:00Z"):
+    regdir.mkdir(parents=True, exist_ok=True)
+    (regdir / "{}.json".format(thread_id)).write_text(json.dumps({
+        "thread_id": thread_id, "cwd": cwd, "claude_pid": claude_pid,
+        "inbox_path": "/tmp/x/{}/inbox.jsonl".format(thread_id),
+        "registered_at": registered_at,
+    }))
+
+
+def test_cwd_fallback_matches_live_entry(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=1234)
+    out = bridge_resolve.resolve_topic_cwd_fallback(
+        str(tmp_path), registry_dir=str(reg), pid_alive=lambda p: True)
+    assert out == "2103"
+
+
+def test_cwd_fallback_skips_dead_pid(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=99999)
+    out = bridge_resolve.resolve_topic_cwd_fallback(
+        str(tmp_path), registry_dir=str(reg), pid_alive=lambda p: False)
+    assert out is None                      # orphaned entry not resolved
+
+
+def test_cwd_fallback_no_match(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, "/somewhere/else", claude_pid=1234)
+    out = bridge_resolve.resolve_topic_cwd_fallback(
+        str(tmp_path), registry_dir=str(reg), pid_alive=lambda p: True)
+    assert out is None
+
+
+def test_cwd_fallback_multi_disambiguates_by_ancestor(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=111, registered_at="2026-01-01T00:00:00Z")
+    _write_reg(reg, 2200, str(tmp_path), claude_pid=222, registered_at="2026-02-02T00:00:00Z")
+    out = bridge_resolve.resolve_topic_cwd_fallback(
+        str(tmp_path), registry_dir=str(reg), pid_alive=lambda p: True,
+        ancestor_pid=lambda: 111)
+    assert out == "2103"                    # ancestor pid picks the right one
+
+
+def test_cwd_fallback_multi_newest_wins_without_ancestor(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=111, registered_at="2026-01-01T00:00:00Z")
+    _write_reg(reg, 2200, str(tmp_path), claude_pid=222, registered_at="2026-02-02T00:00:00Z")
+    out = bridge_resolve.resolve_topic_cwd_fallback(
+        str(tmp_path), registry_dir=str(reg), pid_alive=lambda p: True,
+        ancestor_pid=lambda: None)
+    assert out == "2200"                    # newest registered_at
+
+
+def test_resolve_prefers_pane_over_cwd_fallback(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 9999, str(tmp_path), claude_pid=1234)  # cwd would give 9999
+    env = {"TMUX_PANE": "%7", "PWD": str(tmp_path)}
+    out = bridge_resolve.resolve(
+        env=env, pane_option_reader=_reader({"%7": "2103"}),
+        registry_dir=str(reg))
+    assert out == "2103"                    # pane path wins; cwd not consulted
+
+
+def test_resolve_falls_back_to_cwd_when_no_pane(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=1234)
+    env = {"PWD": str(tmp_path)}            # no pane, no env binding
+    out = bridge_resolve.resolve(
+        env=env, pane_option_reader=_reader({}), registry_dir=str(reg))
+    assert out == "2103"
+
+
+def test_resolve_pane_only_mode_skips_fallback(tmp_path):
+    reg = tmp_path / "registry"
+    _write_reg(reg, 2103, str(tmp_path), claude_pid=1234)
+    env = {"PWD": str(tmp_path)}
+    out = bridge_resolve.resolve(
+        env=env, pane_option_reader=_reader({}), registry_dir=str(reg),
+        cwd_fallback=False)
+    assert out is None                      # post-cutover: no cwd fallback

@@ -84,6 +84,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
+
 GATED_FILE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 # How long to wait for the owner to answer before self-resolving (deny). Generous
 # on purpose: the owner may be away from their phone (driving, in a meeting). Must
@@ -477,17 +479,24 @@ def main():
     # THE GATE: this permission model applies to EVERY bridge session -- one
     # attached to a Telegram topic -- and to nothing else, regardless of HOW the
     # session started (/new spawn OR /telegram attach). The experience must not
-    # depend on the launch path. We detect a bridge session by resolving its topic
-    # from the registry (by cwd); a non-bridge session is none of our business, so
-    # we abstain instantly (find_topic's no-match path does no subprocess) and the
-    # session's normal permission flow is left untouched.
-    topic = find_topic(cwd)
-    if topic is None:
+    # depend on the launch path. We resolve this session's topic via the shared
+    # resolver: the pane option (+ env spawn-binding) first, then a cwd-keyed
+    # fallback for sessions bound before the pane-keying migration. A non-bridge
+    # session resolves to None and we abstain instantly, leaving its normal
+    # permission flow untouched.
+    thread_id = bridge_resolve.resolve(cwd=cwd)
+    if thread_id is None:
         abstain()
-    thread_id, session_dir = topic
-    if not session_dir:
+    # Load this thread's registry entry for the inbox / session dir (where the
+    # perm-pending / perm-answer side-channel files live).
+    try:
+        _reg = json.loads((REGISTRY_DIR / "{}.json".format(thread_id)).read_text())
+        _inbox = _reg.get("inbox_path") or ""
+    except (OSError, ValueError):
         abstain()
-    session_dir = Path(session_dir)
+    if not _inbox:
+        abstain()
+    session_dir = Path(_inbox).parent
 
     mode = spawned_mode()
 

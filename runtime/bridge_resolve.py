@@ -39,6 +39,8 @@
 #
 # Stdlib only; resolves on /usr/bin/python3 via PATH.
 
+import glob
+import json
 import os
 import subprocess
 
@@ -48,6 +50,11 @@ import subprocess
 TMUX_BIN = os.environ.get("TELEGRAM_BRIDGE_TMUX", "/opt/homebrew/bin/tmux")
 PANE_OPTION = "@telegram_thread_id"
 ENV_THREAD = "TELEGRAM_BRIDGE_THREAD_ID"
+
+STATE_DIR = os.environ.get(
+    "TELEGRAM_BRIDGE_STATE_DIR",
+    os.path.join(os.path.expanduser("~"), ".local", "state", "telegram-bridge"))
+REGISTRY_DIR = os.path.join(STATE_DIR, "registry")
 
 
 def read_pane_option(pane, tmux_bin=TMUX_BIN):
@@ -100,3 +107,123 @@ def resolve_topic(env=None, pane_option_reader=read_pane_option, log=None):
     if env_tid:
         return env_tid           # spawn-race window: pane option not yet stamped
     return None                  # not a bridge session
+
+
+# --- migration fallback (cwd-keyed) -----------------------------------------
+# Removed after the pane-keyed cutover. During migration, a session bound before
+# the upgrade has no pane option and no env var, so it must still resolve by cwd
+# the way the pre-pane resolvers did. Centralizing the OLD logic here too means the
+# three callers share ONE implementation during the transition, not three copies.
+
+def _pid_alive(pid):
+    """True if the process is alive. A dead claude_pid means an orphaned registry
+    entry that must not gate a fresh session sharing the same cwd."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user (defensive; same-user here)
+
+
+def _claude_ancestor_pid():
+    """PID of the `claude` process owning this call, by walking up the tree. Lets
+    same-cwd sessions disambiguate to the right registry entry. macOS `ps -o comm=`
+    truncates to 16 chars, so use `ps -c`."""
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return None
+        try:
+            out = subprocess.run(["ps", "-c", "-o", "comm=,ppid=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if not out:
+            return None
+        toks = out.rsplit(None, 1)
+        comm = toks[0] if toks else ""
+        if "claude" in comm.lower():
+            return pid
+        try:
+            pid = int(toks[1]) if len(toks) > 1 else -1
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_topic_cwd_fallback(cwd, registry_dir=REGISTRY_DIR,
+                               pid_alive=_pid_alive, ancestor_pid=_claude_ancestor_pid):
+    """Old cwd-keyed resolution, preserved for the migration window. Returns the
+    thread id (str) for the registry entry matching `cwd`, or None.
+
+    Mirrors the pre-pane behavior exactly so a pre-upgrade session keeps resolving:
+    match on realpath(cwd) + a non-null thread_id, SKIP entries whose claude_pid is
+    dead (the shipped orphan-gate fix), then on multiple live matches disambiguate by
+    the owning claude pid, newest registered_at as the last resort."""
+    if not cwd or not os.path.isdir(registry_dir):
+        return None
+    cwd = os.path.realpath(cwd)
+    matches = []   # (registered_at, claude_pid, thread_id)
+    for f in glob.glob(os.path.join(registry_dir, "*.json")):
+        try:
+            reg = json.loads(open(f).read())
+        except (OSError, ValueError):
+            continue
+        rc = reg.get("cwd")
+        if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
+            continue
+        cp = reg.get("claude_pid")
+        if cp is not None and not pid_alive(cp):
+            continue   # orphaned entry (dead session) — don't resolve to it
+        matches.append((str(reg.get("registered_at", "")), cp, str(reg["thread_id"])))
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0][2]
+    cpid = ancestor_pid()
+    if cpid is not None:
+        for m in matches:
+            if m[1] == cpid:
+                return m[2]
+    matches.sort(reverse=True)   # newest registered_at wins
+    return matches[0][2]
+
+
+def resolve(env=None, pane_option_reader=read_pane_option, cwd=None,
+            registry_dir=REGISTRY_DIR, log=None, cwd_fallback=True):
+    """Top-level resolver used by the hook / MCP / AUQ-hook. Pane-keyed first
+    (`resolve_topic`); during migration falls back to cwd-keyed resolution so a
+    session bound before the upgrade still resolves. Pass `cwd_fallback=False` for
+    the post-cutover pane-only behavior. Returns a thread id (str) or None; the
+    caller then loads the registry entry by thread id for inbox/session_dir."""
+    tid = resolve_topic(env=env, pane_option_reader=pane_option_reader, log=log)
+    if tid is not None:
+        return tid
+    if not cwd_fallback:
+        return None
+    e = os.environ if env is None else env
+    cwd = cwd or e.get("PWD") or os.getcwd()
+    return resolve_topic_cwd_fallback(cwd, registry_dir=registry_dir)
+
+
+def _which_path():
+    """Diagnostic: report how THIS pane/session resolves (pane / env / cwd / none).
+    Used to validate the canary by eye — run from a pane and see which path wins."""
+    env_tid = (os.environ.get(ENV_THREAD) or "").strip()
+    pane = (os.environ.get("TMUX_PANE") or "").strip()
+    pane_tid = read_pane_option(pane).strip() if pane else ""
+    if pane_tid:
+        return "pane", pane_tid
+    if env_tid:
+        return "env", env_tid
+    tid = resolve_topic_cwd_fallback(os.environ.get("PWD") or os.getcwd())
+    if tid:
+        return "cwd-fallback", tid
+    return "none", None
+
+
+if __name__ == "__main__":
+    path, tid = _which_path()
+    print("resolved via {}: thread_id={}".format(path, tid))
