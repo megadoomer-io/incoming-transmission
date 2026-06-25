@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — session lifecycle: reaping, /attach, orphan cleanup
+
+### Added
+- **`/attach` — adopt an existing Claude session.** Lists unattached `claude`
+  panes in the shared tmux session and binds one to a topic by sending it
+  `/telegram-bridge`, so a session you started by hand becomes phone-reachable
+  without respawning. (`telegram-router.py`.)
+- **Bridge-owned flag + reaping policy.** A `/new` spawn is marked
+  `TELEGRAM_BRIDGE_SPAWNED=1`; `/end` reaps the tmux window only when the bridge
+  owns it, while a compaction rollover reaps the superseded window regardless of
+  ownership. An adopted (user-started) session is detached on `/end`, never
+  reaped. (`telegram-router.py`, `telegram-spawn.sh`.)
+
+### Changed
+- **Daemon commands work from any topic.** `/new`, `/attach`, `/sessions`,
+  `/whoami`, `/help` are handled by the router from whatever topic they're typed
+  in — every topic doubles as a control channel. (`telegram-router.py`.)
+
+### Fixed
+- **Orphaned registry entries no longer gate fresh sessions.** A reboot or crash
+  leaves a dead session's registry JSON on disk; because the permission hook
+  resolves a bridge session by cwd, a fresh Claude opened in that directory
+  matched the dead entry and routed its approvals to a Telegram topic no one was
+  watching, hanging ~28 min. The router now prunes registry entries whose
+  `claude_pid` is dead at startup. (`telegram-router.py`.)
+
 ## Unreleased — risk-tiered permissions (Tier 2)
 
 The Tier-2 permission gate now works for real and applies uniformly to **every**
