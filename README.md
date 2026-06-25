@@ -20,7 +20,7 @@ The one exception is the **optional** AskUserQuestion MCP server
 (`telegram-auq-mcp.py`), which needs the `mcp` package and runs via
 [`uv`](https://docs.astral.sh/uv/); you only need it if you spawn unattended
 sessions with `/new` and want them to ask you questions on the phone. Everything
-else — router, hooks, poll loop, watchdog — is stdlib-only.
+else — router, hooks, poll loop, wedge auto-clear — is stdlib-only.
 
 > ## ⚠️ Status: early release
 >
@@ -84,8 +84,10 @@ Phone topic <──────────────────────�
   ownership, loads the bridge procedure, and does an initial drain. The session runs
   NO cron — the router pushes on arrival and re-pushes anything left undrained.
   Processing is in-session, so a message never interrupts running work.
-- **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
-  safety net for a session wedged on an interactive prompt nobody can answer.
+- **Wedge auto-clear** (built into the router) is the safety net for a session
+  wedged on a native prompt nobody can answer remotely. The router's context thread
+  watches its own bridged panes and, if one persists on a blocking prompt, sends
+  Esc (cancel-only, never approve) and tells the owner. No separate daemon.
 
 See [docs/architecture.md](docs/architecture.md) for the full picture — diagrams of
 the system topology, the message lifecycle (push delivery + backstop), the
@@ -296,7 +298,6 @@ into `~/.local/state/telegram-bridge/state.json` on first contact with the bot.
 
 ```bash
 telegram-bridge start|stop|restart|status|log
-telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
 ```
 
 ## Security notes
@@ -307,8 +308,8 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
   This narrows the bootstrap-hijack window (where the first person to message the
   bot becomes the owner) to "you set your handle, then you message the bot".
 - The bot token is read from the environment, never placed on a command line.
-- **Token in the plist**: `telegram-bridge start` / `watchdog-start` render the bot
-  token into the launchd plists under `~/Library/LaunchAgents/`. Those files are
+- **Token in the plist**: `telegram-bridge start` renders the bot token into the
+  launchd plist under `~/Library/LaunchAgents/`. That file is
   `chmod 600` (owner-only) right after rendering so the token isn't group/world
   readable. A stronger option — keeping the token out of the plist entirely (e.g.
   sourcing it from the Keychain or a separate 600 env file the daemon reads at
@@ -325,8 +326,8 @@ telegram-bridge watchdog-start|watchdog-stop   # optional wedge watchdog
 - **Installer lightly tested.** The runtime is proven and in daily use; the
   packaged `install.sh` and wiring steps are newly extracted and not yet run from a
   clean clone by a third party. See the status banner up top.
-- **macOS only (for now).** The daemon + watchdog are launchd services and the
-  installer renders launchd plists. The Python runtime is portable; a Linux
+- **macOS only (for now).** The daemon is a launchd service and the installer
+  renders a launchd plist. The Python runtime is portable; a Linux
   (systemd) service layer is a TODO.
 - **Claude Code specific.** Sessions are driven by `send-keys` into a Claude Code
   TUI and rely on Claude Code skills, hooks, and MCP. This is not a generic

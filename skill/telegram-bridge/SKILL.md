@@ -42,10 +42,11 @@ Phone topic <────────────────────── 
   the router pushes on arrival and re-pushes anything left undrained. Processing is
   in-session, so an incoming message waits until the session finishes its current
   work (it won't interrupt a running task).
-- **Watchdog daemon** (`telegram-watchdog`, a separate launchd timer) is the safety
-  net for the failure the push/backstop *can't* catch: a session wedged on an
-  interactive prompt nobody can answer. An independent watcher scans the tmux panes
-  and alerts the owner. See "Wedge watchdog" below.
+- **Wedge auto-clear** (built into the router's `context_loop`, no separate daemon)
+  is the safety net for the failure the push/backstop *can't* catch: a session
+  wedged on a native prompt nobody can answer remotely. The router watches its own
+  bridged panes and, after a dwell, sends Esc to cancel and tells the owner. See
+  "Wedge auto-clear" below.
 
 ## When to Use
 
@@ -347,32 +348,35 @@ the ultimate safety net if the router's detection is ever down.
 Trigger it manually with `/compact` from the topic; check the gauge any time with
 `/context`.
 
-## Wedge watchdog
+## Wedge auto-clear
 
 The router's push/backstop rescues a session only when the session is *idle*. It
-cannot rescue a session that is **wedged on an interactive prompt** — a native
-permission prompt (from a pre-fix session or a tool the Tier-2 hook doesn't cover),
-an `ssh-add` passphrase, a "trust this folder" dialog, or a native AskUserQuestion
-fallback. While blocked at the prompt the session never goes idle, so a `send-keys`
-nudge just buffers behind the prompt and never runs. The session cannot notice its
-own wedge.
+cannot rescue a session that is **wedged on a native prompt** the bridge can't
+answer over Telegram — a native AskUserQuestion menu, a "trust this folder" dialog,
+or an `ssh-add` passphrase. (Ordinary tool-permission prompts don't wedge: the
+Tier-2 hook + `--permission-mode dontAsk` suppress them. These are the residue.)
+While blocked at the prompt the session never goes idle, so a `send-keys` drain
+nudge just buffers behind it and never runs. The session cannot notice its own wedge.
 
-`telegram-watchdog.py` is the out-of-band watcher. A separate launchd timer
-(`com.telegram.watchdog`, `StartInterval` 60s) scans every pane in the `claude`
-tmux session, matches the captured tail against wedge signatures, and — if the same
-prompt persists past the dwell window (`TELEGRAM_WATCHDOG_DWELL_S`, default 180s) —
-posts a one-time `⚠️` alert. It maps the pane to its bridge topic (by the registry's
-`claude_pid`) and alerts there; an unattached pane alerts the General topic. The
-alert names the window, pane, elapsed time, and the prompt's first line, and tells
-you to attach and answer.
+This is handled **inside the router**, not a separate daemon. The `context_loop`
+thread (the same one that drives the gauge, compaction, and the undrained backstop)
+also watches for wedges each interval. The crucial difference from the old standalone
+watchdog: it looks at **only the bridge's own panes** (a registry topic whose
+`claude_pid` resolves to a pane), never the user's own interactive or stale sessions.
 
-- **Alert-only.** v1 never sends keystrokes — a blind keypress into a pane is too
-  risky to do unattended. Auto-deny could be a future opt-in.
-- **Dwell-gated + once-per-episode.** A human mid-thought at a prompt isn't flagged
-  (must persist past the dwell), and a given wedge alerts once until it clears. State
-  lives in `~/.local/state/telegram-bridge/watchdog-state.json`.
-- **Off by removing the launchd job** (see Daemon control). The script is harmless
-  until the timer loads it; `--dry-run` scans and prints without sending.
+Per bridged topic, each sweep:
+- **Skips a permission already on the phone.** If `perm-pending.json` exists for the
+  topic, the Tier-2 hook is intentionally blocking on the owner's answer — that's not
+  a wedge.
+- **Captures the pane tail** and matches it against wedge signatures.
+- **Tracks the episode.** A signature must persist past `wedge_dwell_seconds`
+  (default 300s, set in `compaction.json`) before any action — a human mid-thought
+  isn't flagged. State is in-memory, so a router restart re-arms a clean episode.
+- **Auto-clears once.** On a ripe wedge it sends **`Escape`** — which can only
+  *cancel* a prompt, never *approve* one, so it's safe to send blind. It then injects
+  a trusted inbox note telling the session the prompt was cancelled and to ask via
+  the topic (not a native prompt), nudges it to drain, and posts a `🪤` alert to the
+  topic so you know it happened and can steer.
 
 Signatures matched: `Do you want to proceed?`, `Do you want to make this edit`,
 `Do you want to create`, `Do you trust the files`, `Enter passphrase`, and the
@@ -546,6 +550,3 @@ gated despite a global Bash allowlist. (NOTE: the gate is bridge-MEMBERSHIP, not
 | `telegram-bridge stop` | Stop it |
 | `telegram-bridge status` | Status, owner, chat id, attached topics |
 | `telegram-bridge log` | Tail the router log |
-| `telegram-bridge watchdog-start` | Start the wedge watchdog (renders + loads its plist) |
-| `telegram-bridge watchdog-stop` | Stop the wedge watchdog |
-| `telegram-watchdog.py --dry-run` | Scan panes now, print findings, send nothing |

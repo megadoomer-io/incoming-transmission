@@ -1,7 +1,8 @@
 // System Architecture
 // The smart-router / dumb-session topology: the phone, the one router daemon
-// (the Massive) that owns all timing, the sessions it routes to (Invaders), and
-// the out-of-band watchdog. Zim vocabulary matches the README.
+// (the Massive) that owns all timing, and the sessions it routes to (Invaders).
+// Wedge auto-clear lives in the router's context_loop. Zim vocabulary matches
+// the README.
 //
 // Render: dot -Tsvg system-architecture.dot -o system-architecture.svg
 
@@ -44,8 +45,6 @@ digraph system_architecture {
         STATUS  [label="status.json\n+ pinned sticky", shape=note, fillcolor="#ffffff"];
     }
 
-    WATCHDOG [label="wedge watchdog\ntelegram-watchdog.py (launchd timer)\nalerts on stuck interactive prompts"];
-
     // Inbound transmission
     TOPIC -> TG          [label="you type"];
     TG -> ROUTER         [label="updates"];
@@ -62,7 +61,7 @@ digraph system_architecture {
     CTX -> SESSION       [label="trigger /compact ·\nre-nudge undrained", style=dotted];
     STATUS -> ROUTER     [label="edit pin", style=dotted];
 
-    // Safety net
-    WATCHDOG -> SESSION  [label="scan tmux panes", style=dotted, color="#9e9e9e"];
-    WATCHDOG -> TG       [label="⚠️ wedge alert", color="#9e9e9e"];
+    // Safety net: wedge auto-clear (bridged panes only, Esc-cancel)
+    CTX -> SESSION       [label="wedge: Esc-cancel\nstuck native prompt", style=dotted, color="#9e9e9e"];
+    CTX -> TG            [label="⚠️ wedge cleared", color="#9e9e9e"];
 }

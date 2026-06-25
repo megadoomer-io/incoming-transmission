@@ -16,8 +16,7 @@ vocabulary (the Massive, Invader, the Tallest, transmission, PAK) matches the
 ## System topology
 
 The pieces and who talks to whom: your phone's forum topic, the router daemon that
-is the only process allowed to read Telegram, the sessions it routes to, and the
-out-of-band watchdog.
+is the only process allowed to read Telegram, and the sessions it routes to.
 
 ![System architecture](diagrams/system-architecture.svg)
 
@@ -31,9 +30,12 @@ out-of-band watchdog.
   slow transcript scan can't stall routing.
 - **An Invader** is a live Claude Code session bound to one topic. It keeps full
   context, MCP, and hooks, and only acts when nudged.
-- **The wedge watchdog** (`telegram-watchdog.py`, a separate launchd timer) is the
-  safety net for a session stuck on an interactive prompt nobody can answer — the
-  one failure push delivery can't catch, because a wedged session never goes idle.
+- **Wedge auto-clear** lives in the router's `context_loop` (no separate daemon). It
+  watches only the bridge's own panes; when one persists on a native prompt nobody
+  can answer remotely (a native AskUserQuestion menu, a trust-folder dialog, an ssh
+  passphrase), it sends Esc — cancel-only, never approve — and pings the owner. This
+  is the one failure push delivery can't catch, because a wedged session never goes
+  idle to receive a drain nudge.
 
 ## Message lifecycle
 
