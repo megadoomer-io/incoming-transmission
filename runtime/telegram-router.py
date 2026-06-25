@@ -1009,6 +1009,11 @@ def handle_message(msg, state):
         return
 
     # --- setup / meta commands ---
+    # These daemon-level commands (whoami/help/sessions/new/attach) are handled
+    # here from ANY topic, not just General — intentional. Every topic doubles as
+    # a control channel, so you can spawn or adopt a sibling session from wherever
+    # you happen to be; the reply lands in the topic you typed it in. Do NOT gate
+    # these on "General only" — the any-topic reach is a deliberate feature.
     cmd = text.split()[0].lstrip("/").lower() if text else ""
     cmd = cmd.split("@")[0]  # strip /cmd@botname form
     if cmd == "whoami":
