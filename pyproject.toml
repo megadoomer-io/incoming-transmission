@@ -1,0 +1,17 @@
+# Dev tooling only. The bridge RUNTIME (runtime/*.py) is deliberately stdlib-only,
+# zero-dependency, and resolves on /usr/bin/python3 — nothing here is required to run
+# the bridge. pytest is a development dependency for the test suite (`make test`).
+[project]
+name = "incoming-transmission"
+version = "0.0.0"
+description = "Telegram <-> Claude Code bridge (dev metadata for the test suite only)"
+requires-python = ">=3.9"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests import the stdlib runtime modules directly (they aren't a package).
+pythonpath = ["runtime"]
+addopts = "-q"

@@ -17,3 +17,7 @@ runtime/lifecycle/*.txt
 # Secrets
 .env
 *.token
+
+# Dev test tooling (uv venv + pytest cache)
+.venv/
+.pytest_cache/
