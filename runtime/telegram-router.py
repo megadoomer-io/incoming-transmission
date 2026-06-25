@@ -1077,7 +1077,7 @@ def handle_message(msg, state):
     if cmd == "attach":
         # /attach [<n>|<window>] — adopt an EXISTING, unattached Claude session in the
         # shared tmux session into its own topic. With no arg, list candidates. The
-        # mechanism: send-keys `/telegram` into the chosen pane so the session attaches
+        # mechanism: send-keys `/telegram-bridge` into the chosen pane so the session attaches
         # ITSELF — it has no TELEGRAM_BRIDGE_SPAWNED, so it registers spawned:false
         # (user-owned), and is therefore never reaped on /end (only detached).
         parts = text.split(maxsplit=1)
@@ -1108,11 +1108,11 @@ def handle_message(msg, state):
                          .format(selector), thread_id=thread_id, reply_to=message_id)
             return
         pane_id = target[0]
-        _tmux("send-keys", "-t", pane_id, "-l", "/telegram")
+        _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
         _tmux("send-keys", "-t", pane_id, "Enter")
-        send_message(chat_id, "Sent /telegram to {} — it'll open its own topic shortly."
+        send_message(chat_id, "Sent /telegram-bridge to {} — it'll open its own topic shortly."
                      .format(target[2]), thread_id=thread_id, reply_to=message_id)
-        log("attach: sent /telegram to pane {} ({})".format(pane_id, target[2]))
+        log("attach: sent /telegram-bridge to pane {} ({})".format(pane_id, target[2]))
         return
 
     # --- route to the session that owns this topic ---
