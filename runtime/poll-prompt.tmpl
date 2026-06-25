@@ -52,7 +52,15 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
            /end     -> FIRST run your END hook: follow the instructions in
                        ~/.telegram-bridge/lifecycle/end.txt (ignore #-comment lines;
                        may be empty = no extra actions). THEN deregister: rm the
-                       registry file, closeForumTopic, reply "Session detached."
+                       registry file, closeForumTopic, reply "Session detached." THEN
+                       reap THIS window ONLY IF it's bridge-owned — i.e. only if env
+                       TELEGRAM_BRIDGE_SPAWNED=1 AND $TMUX_PANE is set (a /new spawn).
+                       Read kill_old from ~/.telegram-bridge/compaction.json and target
+                       $TMUX_PANE explicitly (a bare rename hits the ACTIVE window):
+                         kill_old false (default): tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
+                         kill_old true:            tmux kill-window -t "$TMUX_PANE"
+                       A user-attached session (no SPAWNED — /telegram or /attach) just
+                       detaches: leave the live terminal, do NOT reap.
          Only those SIX are bridge commands. Any OTHER "/" text (/track, /ship,
          /review, ...) is NOT a bridge command — treat it as a task so skills can be
          driven from the phone. (Daemon-level /new, /whoami, /sessions, /help never
@@ -96,10 +104,14 @@ COMPACTION HANDOFF (run from the /compact command):
    6. Hand off: rm SESS/compacting.lock. This releases the replacement to begin
       draining (the router resumes pushing/backstopping it).
    7. Post: ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} "✅ compacted — fresh session is live."
-   8. Retire this tmux window for cleanup — ONLY if this session was spawned by the
-      bridge (env TELEGRAM_BRIDGE_SPAWNED=1) AND $TMUX_PANE is set. Otherwise SKIP.
-      Target the window explicitly via $TMUX_PANE (a bare rename/display resolves to
-      the ACTIVE window, not this one). Read kill_old from ~/.telegram-bridge/compaction.json:
+   8. Retire this OLD window — a replacement now exists, so this session is
+      superseded (dead weight in tmux). Reap it whenever it's a killable tmux window:
+      if $TMUX_PANE is set, retire it REGARDLESS of ownership (unlike /end, ownership
+      does NOT matter here — a replacement supersedes both bridge-owned and
+      user-attached old sessions; keep tmux clean). If $TMUX_PANE is unset (a
+      standalone terminal, not a tmux window), SKIP — it can't be killed. Target
+      $TMUX_PANE explicitly (a bare rename/display hits the ACTIVE window). Read
+      kill_old from ~/.telegram-bridge/compaction.json:
         - kill_old false (default): tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
         - kill_old true:            tmux kill-window -t "$TMUX_PANE"
    9. STOP. This session has handed off; take no further action.

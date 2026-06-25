@@ -181,6 +181,10 @@ print(json.dumps({
   "cwd": cwd,
   "transcript_path": transcript,   # "" if discovery failed; poll falls back to skip
   "claude_pid": claude_pid(),      # exact session match for same-cwd disambiguation
+  # bridge-owned? True only for a /new spawn (TELEGRAM_BRIDGE_SPAWNED=1). A
+  # /telegram or /attach adopt is the user's OWN window -> False. Gates /end
+  # reaping: a bridge-owned window is killed on /end; a user window is just detached.
+  "spawned": os.environ.get("TELEGRAM_BRIDGE_SPAWNED") == "1",
   "context": "session attached",
   "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }, indent=2))
