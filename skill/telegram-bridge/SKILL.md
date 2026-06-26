@@ -1,7 +1,7 @@
 ---
 name: telegram-bridge
 description: Open a Telegram forum topic bound to this Claude session — messages typed there route to this live session, which replies in-topic with full context.
-version: 1.7.0
+version: 1.8.0
 ---
 
 # /telegram
@@ -37,9 +37,10 @@ Phone topic <────────────────────── 
   and **backstops delivery** — if a pushed message stays undrained it re-nudges
   (throttled, and only while the inbox is non-empty) — all OFF the getUpdates path.
 - **This skill** loads the bridge procedure into context and does an initial drain.
-  Binding (topic + registry + pane stamp) is normally already done programmatically by
-  the spawn script / router before the skill runs; the skill self-binds only as a
-  legacy fallback. The session runs **NO cron at all** — no
+  Binding (topic + registry + pane stamp) is programmatic on every path — the spawn
+  script (`/new` + rollover), the router (`/attach`), or the shared `bridge_bind`
+  self-bind helper when you run `/telegram` at the keyboard. The skill never runs
+  createForumTopic or writes the registry itself. The session runs **NO cron at all** — no
   fast poll cron, no fallback heartbeat, no backoff ladder. It is purely reactive:
   the router pushes on arrival and re-pushes anything left undrained. Processing is
   in-session, so an incoming message waits until the session finishes its current
@@ -92,163 +93,30 @@ THREAD_ID=""
 [ -n "$THREAD_ID" ] || THREAD_ID="${TELEGRAM_BRIDGE_THREAD_ID:-}"
 ```
 
-**If `THREAD_ID` is set, you are already bound.** Compute `INBOX`, then SKIP the
-legacy self-bind (Step 2-legacy + Step 3) and go to Step 3.5 (attach mode only) →
-Step 4. Do NOT create a topic, write the registry, or stamp the pane — done already.
+**If `THREAD_ID` is set, you are already bound** (the spawn or router did it).
+Compute `INBOX` and skip to Step 3.5 (attach mode only) → Step 4. Do NOT create a
+topic, write the registry, or stamp the pane — that's done.
 
 ```bash
 INBOX="/tmp/claude-telegram/sessions/$THREAD_ID/inbox.jsonl"
 ```
 
-**If `THREAD_ID` is empty, self-bind (legacy fallback)** — e.g. you ran `/telegram`
-by hand in a plain terminal with no router pre-binding. Do Step 2-legacy + Step 3.
-(Retained during the pane-keying migration; removed in the clean cutover.)
-
-#### Step 2-legacy: get a forum topic (only if not already bound)
-
-**First check for compaction-replacement (attach) mode.** If the env var
-`TELEGRAM_BRIDGE_ATTACH_THREAD` is set, this session is a replacement for a topic
-whose previous session ran out of context (see "Auto-compaction" below). In that
-case **do NOT create a topic** — reuse the existing one:
+**If `THREAD_ID` is empty, bind this session now** — e.g. you ran `/telegram` by
+hand at the keyboard. Binding is programmatic: the shared self-bind helper creates
+the topic, stamps THIS pane's `@telegram_thread_id`, and writes the registry — the
+same `bind_pane` the router's `/attach` uses, so there's no LLM-run topic creation
+or registry heredoc. It prints the new thread id to stdout:
 
 ```bash
-if [ -n "${TELEGRAM_BRIDGE_ATTACH_THREAD:-}" ]; then
-  THREAD_ID="$TELEGRAM_BRIDGE_ATTACH_THREAD"
-  echo "attach mode: reusing existing topic $THREAD_ID"
-fi
-```
-
-Set `THREAD_ID` to that value and skip the `createForumTopic` call below.
-
-**Otherwise (normal attach), create a fresh topic** named from the repo + branch
-(fall back to the cwd basename):
-
-```bash
-NAME="$(basename "$PWD")@$(git branch --show-current 2>/dev/null || echo nogit)"
-python3 - "$CHAT_ID" "$NAME" <<'PY'
-import json, os, sys, urllib.request
-tok = os.environ["TELEGRAM_BRIDGE_BOT_TOKEN"]
-chat, name = sys.argv[1], sys.argv[2]
-data = json.dumps({"chat_id": int(chat), "name": name}).encode()
-req = urllib.request.Request(
-    f"https://api.telegram.org/bot{tok}/createForumTopic",
-    data=data, headers={"Content-Type": "application/json"})
-r = json.load(urllib.request.urlopen(req, timeout=30))
-print(r["result"]["message_thread_id"] if r.get("ok") else "ERROR: %s" % r)
-PY
-```
-
-Capture the printed `message_thread_id` as `THREAD_ID`.
-
-### Step 3: Register ownership (legacy self-bind — SKIP if already bound)
-
-> Skip this entire step if Step 2 found you already bound. It runs only on the
-> legacy fallback path (a hand-run `/telegram` with no router/spawn pre-binding).
-
-Write `~/.local/state/telegram-bridge/registry/<THREAD_ID>.json` so the daemon routes
-this topic's messages to this session's inbox. The registry also records this
-session's **transcript path** so the router can compute context occupancy (for the
-status sticky + auto-compaction).
-
-Discovering your own transcript: the `SessionStart` hook
-(`telegram-self-register.py`) wrote `~/.local/state/telegram-bridge/self/<id>.json`
-records of every live session's `{transcript_path, cwd}`. Pick the newest-mtime
-transcript among records matching this cwd — since this session's transcript is being
-written *right now* (you're running `/telegram`), it wins:
-
-```bash
-THREAD_ID=<from step 2>
+THREAD_ID="$(python3 ~/.telegram-bridge/bridge_bind.py)" || true
+[ -n "$THREAD_ID" ] || { echo "bind failed (not in a tmux pane, or the bridge has no chat_id yet) — use /new or /attach instead" >&2; exit 1; }
 INBOX="/tmp/claude-telegram/sessions/$THREAD_ID/inbox.jsonl"
-mkdir -p "$(dirname "$INBOX")"
-REG="$HOME/.local/state/telegram-bridge/registry/$THREAD_ID.json"
-python3 - "$THREAD_ID" "$INBOX" "$PWD" <<'PY' > "$REG"
-import json, sys, os, glob, datetime, subprocess
-
-thread_id, inbox, cwd = sys.argv[1], sys.argv[2], sys.argv[3]
-
-# Find this session's own transcript: newest-mtime self-record matching cwd.
-selfdir = os.path.expanduser("~/.local/state/telegram-bridge/self")
-transcript = ""
-best_m = -1.0
-for f in glob.glob(os.path.join(selfdir, "*.json")):
-    try:
-        rec = json.load(open(f))
-    except Exception:
-        continue
-    if rec.get("cwd") != cwd:
-        continue
-    tp = rec.get("transcript_path")
-    if not tp or not os.path.exists(tp):
-        continue
-    m = os.path.getmtime(tp)
-    if m > best_m:
-        best_m, transcript = m, tp
-
-# PID of the owning `claude` process (walk up the tree). Lets consumers that
-# share a cwd (the AskUserQuestion MCP server, permission hook) match THIS
-# session's topic exactly instead of guessing among same-cwd registry entries.
-def claude_pid():
-    pid = os.getpid()
-    for _ in range(12):
-        if pid <= 1:
-            return None
-        try:
-            out = subprocess.run(["ps", "-c", "-o", "comm=,ppid=", "-p", str(pid)],
-                                 capture_output=True, text=True, timeout=5).stdout.strip()
-        except Exception:
-            return None
-        if not out:
-            return None
-        toks = out.rsplit(None, 1)
-        comm = toks[0] if toks else ""
-        if "claude" in comm.lower():
-            return pid
-        try:
-            pid = int(toks[1]) if len(toks) > 1 else -1
-        except ValueError:
-            return None
-    return None
-
-print(json.dumps({
-  "thread_id": int(thread_id),
-  "inbox_path": inbox,
-  "cwd": cwd,
-  "transcript_path": transcript,   # "" if discovery failed; poll falls back to skip
-  "claude_pid": claude_pid(),      # exact session match for same-cwd disambiguation
-  # bridge-owned? True only for a /new spawn (TELEGRAM_BRIDGE_SPAWNED=1). A
-  # /telegram or /attach adopt is the user's OWN window -> False. Gates /end
-  # reaping: a bridge-owned window is killed on /end; a user window is just detached.
-  "spawned": os.environ.get("TELEGRAM_BRIDGE_SPAWNED") == "1",
-  "context": "session attached",
-  "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-}, indent=2))
-PY
 ```
 
-If `transcript_path` comes out empty (rare — e.g. the SessionStart hook didn't run),
-the context gauge and auto-compaction simply stay dormant for this topic; everything
-else works. You can re-run this block to backfill it later.
+The transcript path is left empty; the router backfills it (matched by pane id) so
+the context gauge starts within a sweep. A compaction replacement never reaches this
+branch — the spawn pre-binds it, so Step 2 sees it as already bound.
 
-Then **stamp the pane option** so the pane-keyed resolver binds this session by its
-tmux pane (not cwd). Best-effort, via the session's own inherited tmux; harmless if
-not in tmux:
-
-```bash
-[ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @telegram_thread_id "$THREAD_ID" || true
-```
-
-The binding is cleared at the other end of the lifecycle: on reap, the default
-`kill_old=false` path renames the retired window `DEAD - <name>` but leaves the
-pane alive, so it also runs `tmux set-option -pu -t "$TMUX_PANE" @telegram_thread_id`
-to drop the stamp (a `kill_old=true` kill-window destroys the pane and its option
-with it). As a safety net the router unsets `@telegram_thread_id` on any pane in a
-`DEAD`-renamed window each sweep, so a missed in-session clear can't leave a stale
-binding that mis-resolves a reused pane.
-
-(This session-side stamp now runs ONLY on the legacy fallback. Spawned and
-`/attach`-adopted sessions are stamped programmatically by the spawn script / router
-before this skill runs, so they never reach here — binding has left the LLM. This
-fallback is removed in the clean cutover.)
 
 ### Step 3.5: (attach mode only) complete the handoff handshake
 

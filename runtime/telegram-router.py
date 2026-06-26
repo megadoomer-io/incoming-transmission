@@ -38,6 +38,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import bridge_bind  # shared programmatic bind (create topic + stamp pane + register)
+
 TOKEN = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN", "")
 API = "https://api.telegram.org/bot{}/{}".format(TOKEN, "{}")
 
@@ -185,42 +187,10 @@ def load_registry(tkey):
     return None
 
 
-def write_registry_entry(thread_id, *, pane_id=None, claude_pid=None, cwd="",
-                         inbox_path=None, spawned=False, transcript_path=""):
-    """Write registry/<thread>.json atomically. The router-side counterpart to the
-    spawn script's registry write (same schema) — used by programmatic /attach
-    binding. transcript_path is left empty by default; the context-loop backfill
-    fills it from the SessionStart self-record. Returns the entry, or None on error."""
-    tid = int(thread_id)
-    if inbox_path is None:
-        inbox_path = "/tmp/claude-telegram/sessions/{}/inbox.jsonl".format(tid)
-    entry = {
-        "thread_id": tid,
-        "pane_id": pane_id or None,
-        "claude_pid": int(claude_pid) if claude_pid else None,
-        "inbox_path": inbox_path,
-        "cwd": cwd,
-        "transcript_path": transcript_path,
-        "spawned": bool(spawned),
-        "context": "session attached",
-        "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    try:
-        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
-        path = REGISTRY_DIR / "{}.json".format(tid)
-        tmp = REGISTRY_DIR / "{}.json.tmp".format(tid)
-        tmp.write_text(json.dumps(entry, indent=2))
-        os.replace(str(tmp), str(path))
-    except OSError as e:
-        log("ERROR write_registry_entry {}: {}".format(tid, e))
-        return None
-    return entry
-
-
 def _persist_registry(tkey, reg):
     """Atomically write a (possibly mutated) registry entry dict back. Used by the
     context-loop backfill, which updates an already-loaded entry in place (so it
-    preserves pane_id/claude_pid/spawned, unlike write_registry_entry which rebuilds)."""
+    preserves pane_id/claude_pid/spawned, unlike a full bridge_bind rebuild)."""
     try:
         path = REGISTRY_DIR / "{}.json".format(tkey)
         tmp = REGISTRY_DIR / "{}.json.tmp".format(tkey)
@@ -401,28 +371,6 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
         tk = "general" if thread_id in (None, "general") else str(thread_id)
         record_msg_thread(mid, tk)
     return last
-
-
-def create_forum_topic(chat_id, name, retries=3):
-    """Create a Telegram forum topic; return its message_thread_id (int) or None.
-
-    Retries a few times because a silent failure would leave a session with no
-    topic — callers MUST NOT bind on None. The router-owned, programmatic version
-    of the createForumTopic call the skill used to make."""
-    params = {"chat_id": chat_id, "name": name}
-    for attempt in range(retries):
-        try:
-            r = api_call("createForumTopic", params)
-        except (urllib.error.URLError, OSError) as e:
-            log("WARN createForumTopic attempt {}: {}".format(attempt + 1, e))
-            time.sleep(1.5)
-            continue
-        if r.get("ok"):
-            return r["result"]["message_thread_id"]
-        log("WARN createForumTopic not ok: {}".format(r))
-        time.sleep(1.5)
-    log("ERROR createForumTopic failed for {!r} after {} attempts".format(name, retries))
-    return None
 
 
 def react_eyes(chat_id, message_id):
@@ -1481,16 +1429,17 @@ def handle_message(msg, state):
         except (OSError, subprocess.SubprocessError):
             branch = ""
         name = "{}@{}".format(os.path.basename(cwd) or "session", branch or "nogit")
-        new_tid = create_forum_topic(chat_id, name)
+        # Bind programmatically via the shared helper (create topic + stamp pane +
+        # write registry) BEFORE the send-keys, so the adopted session detects the
+        # pane option and loads only the drain procedure. Same bind_pane the keyboard
+        # /telegram self-bind uses — one implementation.
+        new_tid = bridge_bind.bind_pane(TOKEN, chat_id, pane_id, cwd,
+                                        claude_pid=pane_pid or None, name=name,
+                                        spawned=False, log=log)
         if new_tid is None:
             send_message(chat_id, "Couldn't create a topic for {} — not attaching."
                          .format(target[2]), thread_id=thread_id, reply_to=message_id)
             return
-        # Bind programmatically BEFORE the send-keys: stamp the pane option (the skill
-        # detects it and skips its own create/register/stamp) and write the registry.
-        _tmux("set-option", "-p", "-t", pane_id, "@telegram_thread_id", str(new_tid))
-        write_registry_entry(new_tid, pane_id=pane_id, claude_pid=pane_pid or None,
-                             cwd=cwd, spawned=False)
         _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
         _tmux("send-keys", "-t", pane_id, "Enter")
         send_message(chat_id, "Attached {} to its topic — it'll start draining shortly."

@@ -39,6 +39,17 @@
   future topic ledger must intercept `forum_topic_*` ahead of that drop.
   (`runtime/telegram-router.py`.)
 
+- **Shared programmatic bind (`bridge_bind.py`) + keyboard `/telegram` self-bind.**
+  Extracted the bind primitives (create topic, stamp pane, write registry) into one
+  stdlib module, the write-side counterpart to `bridge_resolve`. The router's
+  `/attach` now calls `bridge_bind.bind_pane` instead of its own copies, and a new
+  self-bind CLI (`python3 bridge_bind.py`, binds `$TMUX_PANE`) lets a keyboard
+  `/telegram` bind programmatically — same `bind_pane`, no LLM-run createForumTopic
+  or registry heredoc. The SKILL.md legacy heredoc is gone; its not-bound branch is
+  now a one-line CLI call. One bind implementation, three entry points (spawn,
+  router, keyboard). (`runtime/bridge_bind.py`, `runtime/telegram-router.py`,
+  `skill/telegram-bridge/SKILL.md`.)
+
 ### Removed
 - **Clean cutover: the resolver's cwd fallback is gone.** With binding now
   programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
