@@ -617,7 +617,7 @@ def update_stickies(state):
 # a-z/0-9/_. Order = menu order.
 BRIDGE_COMMANDS = [
     ("new", "Spawn a new Claude session (dir/alias + optional intent note)"),
-    ("attach", "Adopt an existing unattached Claude session into a topic"),
+    ("attach", "Adopt an unattached Claude session into a topic (n | all)"),
     ("sessions", "List attached Claude sessions"),
     ("status", "This session: cwd + messages processed"),
     ("context", "This session: live context % gauge"),
@@ -706,9 +706,9 @@ HELP = (
     "/new [dir] [intent note] — spawn a NEW Claude session in dir (default: home) "
     "and auto-attach it to its own topic; any trailing text is an optional intent "
     "note the fresh session starts with\n"
-    "/attach [n|window] — adopt an existing, unattached Claude session in the tmux "
-    "session into its own topic (no arg lists candidates). Unlike /new, it's not "
-    "reaped on /end — just detached.\n"
+    "/attach [n|window|all] — adopt an existing, unattached Claude session in the "
+    "tmux session into its own topic (no arg lists candidates; `all` binds every "
+    "one). Unlike /new, it's not reaped on /end — just detached.\n"
     "/whoami  — show this chat id, your user id, and the current topic id\n"
     "/sessions — list Claude sessions attached to topics\n"
     "/help — this message\n\n"
@@ -790,21 +790,37 @@ def _pane_for_claude_pid(target_pid):
     return None
 
 
+def _pane_label(cwd, window_name):
+    """Friendly /attach label: the cwd basename ('incoming-transmission', 'joey').
+
+    With automatic-rename the window name tracks the foreground process ('zsh'), and
+    Claude Code sets the pane title to a volatile, spinner-prefixed activity line
+    ('⠂ Claude Code', '⠐ Deploy to infra-prod…') — so neither is a stable
+    identifier. The cwd basename names the project, which is what you actually pick a
+    session by (issue #17). Falls back to the window name only when the cwd is empty,
+    then a generic 'session'."""
+    base = os.path.basename((cwd or "").rstrip("/"))
+    return base or window_name or "session"
+
+
 def list_unattached_claude_panes():
     """Claude panes in the shared tmux session that are NOT already bridged — the
     candidates for /attach. A pane is a claude session if its `pane_current_command`
     is claude (an idle TUI; a session mid-tool may briefly read as `bash` and be
     missed — fine, /attach is for an idle session you're choosing to bind). "Already
     bridged" = some registry entry's claude_pid resolves (via _pane_for_claude_pid)
-    to that pane. Returns [(pane_id, window_index, window_name), ...]."""
+    to that pane. Returns [(pane_id, window_index, label), ...], where label is the
+    cwd basename (see _pane_label) — the readable project name you pick a session
+    by, not the (process-tracked) window name."""
     out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
-                "-F", "#{pane_id}\t#{window_index}\t#{window_name}\t#{pane_current_command}")
+                "-F", "#{pane_id}\t#{window_index}\t#{window_name}\t"
+                      "#{pane_current_command}\t#{pane_current_path}")
     claude_panes = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
-        pane_id, widx, wname, curcmd = parts
+        pane_id, widx, wname, curcmd, cwd = parts
         # Adopt only LIVE, user claude sessions in normally-named windows. Skip
         # bridge-managed windows (tg:* — the bridge's domain; an unregistered one is
         # a STALE bridge session, a #6 reap concern, not an adopt candidate) and
@@ -812,7 +828,7 @@ def list_unattached_claude_panes():
         if ("claude" in curcmd.lower()
                 and not wname.startswith("tg:")
                 and not wname.startswith("DEAD")):
-            claude_panes.append((pane_id, widx, wname))
+            claude_panes.append((pane_id, widx, _pane_label(cwd, wname)))
     bridged = set()
     if REGISTRY_DIR.is_dir():
         for f in REGISTRY_DIR.glob("*.json"):
@@ -825,6 +841,36 @@ def list_unattached_claude_panes():
                 if pane:
                     bridged.add(pane)
     return [p for p in claude_panes if p[0] not in bridged]
+
+
+def _attach_one(chat_id, target):
+    """Bind one unattached pane (an /attach candidate tuple) to a fresh topic, off
+    the LLM: resolve the pane's cwd + pid, create topic + stamp pane + write registry
+    via the shared bridge_bind.bind_pane, then send-keys /telegram-bridge so the
+    adopted session detects the already-set pane option and loads only the drain
+    procedure (no create/register/stamp). Returns the new thread_id, or None if the
+    topic couldn't be created (nothing stamped/written — no half-bind). Shared by
+    /attach <n> and /attach all so both run identical bind logic."""
+    pane_id = target[0]
+    # claude is the pane command (or a descendant), so storing the pane pid lets
+    # _pane_for_claude_pid match by walking UP from it.
+    cwd = _tmux("display-message", "-p", "-t", pane_id, "#{pane_current_path}").strip()
+    pane_pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
+    try:
+        branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        branch = ""
+    name = "{}@{}".format(os.path.basename(cwd) or "session", branch or "nogit")
+    new_tid = bridge_bind.bind_pane(TOKEN, chat_id, pane_id, cwd,
+                                    claude_pid=pane_pid or None, name=name,
+                                    spawned=False, log=log)
+    if new_tid is None:
+        return None
+    _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
+    _tmux("send-keys", "-t", pane_id, "Enter")
+    log("attach: bound pane {} ({}) to topic {}".format(pane_id, target[2], new_tid))
+    return new_tid
 
 
 def _stale_pane_ids(list_panes_output):
@@ -1384,13 +1430,14 @@ def handle_message(msg, state):
         return
 
     if cmd == "attach":
-        # /attach [<n>|<window>] — adopt an EXISTING, unattached Claude session in
-        # the shared tmux session into its own topic. With no arg, list candidates.
-        # The router BINDS programmatically (off the LLM): it creates the topic,
-        # stamps the pane option, and writes the registry (spawned:false → a
-        # user-owned window, only detached on /end, never reaped), THEN sends
-        # /telegram-bridge so the session loads only the drain procedure — it detects
-        # the pane option is already set and skips create/register/stamp.
+        # /attach [<n>|<window>|all] — adopt EXISTING, unattached Claude session(s)
+        # in the shared tmux session into their own topic(s). With no arg, list
+        # candidates; `all` binds every candidate. The router BINDS programmatically
+        # (off the LLM): create topic, stamp the pane option, write the registry
+        # (spawned:false → a user-owned window, only detached on /end, never reaped),
+        # THEN send /telegram-bridge so the session loads only the drain procedure —
+        # it detects the pane option is already set and skips create/register/stamp.
+        # All bind paths go through the shared _attach_one.
         parts = text.split(maxsplit=1)
         selector = parts[1].strip() if len(parts) > 1 else ""
         cands = list_unattached_claude_panes()
@@ -1399,10 +1446,29 @@ def handle_message(msg, state):
                          thread_id=thread_id, reply_to=message_id)
             return
         if not selector:
-            lines = ["Unattached Claude sessions — reply /attach <n> to bind one:"]
-            for i, (pid, widx, wname) in enumerate(cands, 1):
-                lines.append("{}. {} (window {})".format(i, wname, widx))
+            lines = ["Unattached Claude sessions — reply /attach <n> to bind one, "
+                     "or /attach all for every one:"]
+            for i, (pid, widx, label) in enumerate(cands, 1):
+                lines.append("{}. {} (window {})".format(i, label, widx))
             send_message(chat_id, "\n".join(lines), thread_id=thread_id, reply_to=message_id)
+            return
+        if selector.lower() == "all":
+            # Bulk-bind every candidate. Each is an independent topic create; a
+            # failure on one (createForumTopic) is reported but doesn't abort the
+            # rest. Report the roster so the owner knows which topics appeared.
+            bound, failed = [], []
+            for c in cands:
+                if _attach_one(chat_id, c) is not None:
+                    bound.append(c[2])
+                else:
+                    failed.append(c[2])
+            msg = ("Attached {} session(s): {}".format(len(bound), ", ".join(bound))
+                   if bound else "Couldn't attach any session.")
+            if failed:
+                msg += "\nFailed ({}): {}".format(len(failed), ", ".join(failed))
+            if bound:
+                msg += "\nEach opens its own topic and starts draining shortly."
+            send_message(chat_id, msg, thread_id=thread_id, reply_to=message_id)
             return
         target = None
         if selector.isdigit():
@@ -1411,40 +1477,20 @@ def handle_message(msg, state):
                 target = cands[k]
         if target is None:
             for c in cands:
-                if selector in (c[2], c[1]):   # window name or index
+                if selector in (c[2], c[1]):   # label or window index
                     target = c
                     break
         if target is None:
             send_message(chat_id, "No match for {!r}. Send /attach with no argument to list."
                          .format(selector), thread_id=thread_id, reply_to=message_id)
             return
-        pane_id = target[0]
-        # Resolve the pane's cwd + pid for the registry. claude is the pane command
-        # (or a descendant), so storing the pane pid lets _pane_for_claude_pid match.
-        cwd = _tmux("display-message", "-p", "-t", pane_id, "#{pane_current_path}").strip()
-        pane_pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
-        try:
-            branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
-                                    capture_output=True, text=True, timeout=5).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            branch = ""
-        name = "{}@{}".format(os.path.basename(cwd) or "session", branch or "nogit")
-        # Bind programmatically via the shared helper (create topic + stamp pane +
-        # write registry) BEFORE the send-keys, so the adopted session detects the
-        # pane option and loads only the drain procedure. Same bind_pane the keyboard
-        # /telegram self-bind uses — one implementation.
-        new_tid = bridge_bind.bind_pane(TOKEN, chat_id, pane_id, cwd,
-                                        claude_pid=pane_pid or None, name=name,
-                                        spawned=False, log=log)
+        new_tid = _attach_one(chat_id, target)
         if new_tid is None:
             send_message(chat_id, "Couldn't create a topic for {} — not attaching."
                          .format(target[2]), thread_id=thread_id, reply_to=message_id)
             return
-        _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
-        _tmux("send-keys", "-t", pane_id, "Enter")
         send_message(chat_id, "Attached {} to its topic — it'll start draining shortly."
                      .format(target[2]), thread_id=thread_id, reply_to=message_id)
-        log("attach: bound pane {} ({}) to topic {}".format(pane_id, target[2], new_tid))
         return
 
     # --- route to the session that owns this topic ---

@@ -309,6 +309,7 @@ generic Claude selection menu (`❯ 1.` choice line plus the `Esc to cancel` foo
 | Command | Action |
 |---------|--------|
 | `/new [dir] [intent note]` | Spawn a NEW Claude session in `dir` (default: home), auto-attached to its own topic. Any text after the dir/alias is an optional free-text intent note injected into the spawn prompt |
+| `/attach [n\|window\|all]` | Adopt an existing, unattached Claude session into its own topic. No arg lists candidates (labelled by project/cwd); `all` binds every one. Not reaped on `/end`, just detached |
 | `/whoami` | Report chat_id, your user_id, current topic id |
 | `/sessions` | List attached sessions/topics |
 | `/help` | Daemon help |

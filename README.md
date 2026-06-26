@@ -208,6 +208,7 @@ Typed in the control group (handled by the Massive):
 | Command | Action |
 |---------|--------|
 | `/new [dir] [intent note]` | deploy a new Invader (spawn a session) attached to its own topic; trailing text is an optional intent note the session starts with |
+| `/attach [n\|window\|all]` | adopt an existing, unattached session into its own topic; no arg lists candidates (by project name), `all` binds every one |
 | `/whoami` | chat_id, your user_id, current topic |
 | `/sessions` | list attached sessions |
 

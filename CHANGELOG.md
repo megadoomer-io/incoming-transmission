@@ -50,6 +50,21 @@
   router, keyboard). (`runtime/bridge_bind.py`, `runtime/telegram-router.py`,
   `skill/telegram-bridge/SKILL.md`.)
 
+- **`/attach` lists candidates by cwd basename, not the window name (issue #17).**
+  With `automatic-rename` on, the window name tracks the foreground process, so the
+  list read `zsh`, `zsh`, `zsh` — useless. Claude Code's pane title is a volatile,
+  spinner-prefixed activity line, also no good as a stable handle. The list now
+  labels each candidate with the cwd basename (`incoming-transmission`, `joey`), the
+  project name you actually pick a session by; selectors match that label or the
+  window index. (`runtime/telegram-router.py` — new `_pane_label`.)
+
+### Added
+- **`/attach all` — bulk-adopt every unattached session.** Binds each candidate in
+  one command (loop create-topic + stamp + register + send-keys), reporting the
+  roster of topics opened and any that failed. The single and bulk paths now share
+  one bind helper (`_attach_one`), so both run identical logic.
+  (`runtime/telegram-router.py`.)
+
 ### Removed
 - **Clean cutover: the resolver's cwd fallback is gone.** With binding now
   programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
