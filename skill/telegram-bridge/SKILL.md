@@ -36,8 +36,10 @@ Phone topic <────────────────────── 
   `context_loop` thread computes each session's context gauge, triggers compaction,
   and **backstops delivery** — if a pushed message stays undrained it re-nudges
   (throttled, and only while the inbox is non-empty) — all OFF the getUpdates path.
-- **This skill** creates the topic, registers ownership, loads the bridge procedure
-  into context, and does an initial drain. The session runs **NO cron at all** — no
+- **This skill** loads the bridge procedure into context and does an initial drain.
+  Binding (topic + registry + pane stamp) is normally already done programmatically by
+  the spawn script / router before the skill runs; the skill self-binds only as a
+  legacy fallback. The session runs **NO cron at all** — no
   fast poll cron, no fallback heartbeat, no backoff ladder. It is purely reactive:
   the router pushes on arrival and re-pushes anything left undrained. Processing is
   in-session, so an incoming message waits until the session finishes its current
@@ -73,7 +75,36 @@ Read `~/.local/state/telegram-bridge/state.json` for `chat_id`. If it's null, st
 and tell the user to message the bot once to bootstrap. If the daemon isn't running,
 offer to start it: `telegram-bridge start`.
 
-### Step 2: Get a forum topic for this session
+### Step 2: Resolve this session's topic binding
+
+Binding — creating the topic, writing the registry, and stamping the pane — is
+normally done **for you**, programmatically (off the LLM), by the spawn script
+(`/new` and compaction rollover) or the router (`/attach`). So FIRST detect whether
+you're already bound; only self-bind as a legacy fallback.
+
+```bash
+CHAT_ID=$(python3 -c "import json;print(json.load(open('$HOME/.local/state/telegram-bridge/state.json'))['chat_id'])")
+# Already bound? Prefer the pane option (authoritative; set for spawns AND adopts),
+# then the TELEGRAM_BRIDGE_THREAD_ID env var (set by the spawn before the pane option
+# is observable).
+THREAD_ID=""
+[ -n "${TMUX_PANE:-}" ] && THREAD_ID="$(tmux display-message -p -t "$TMUX_PANE" '#{@telegram_thread_id}' 2>/dev/null || true)"
+[ -n "$THREAD_ID" ] || THREAD_ID="${TELEGRAM_BRIDGE_THREAD_ID:-}"
+```
+
+**If `THREAD_ID` is set, you are already bound.** Compute `INBOX`, then SKIP the
+legacy self-bind (Step 2-legacy + Step 3) and go to Step 3.5 (attach mode only) →
+Step 4. Do NOT create a topic, write the registry, or stamp the pane — done already.
+
+```bash
+INBOX="/tmp/claude-telegram/sessions/$THREAD_ID/inbox.jsonl"
+```
+
+**If `THREAD_ID` is empty, self-bind (legacy fallback)** — e.g. you ran `/telegram`
+by hand in a plain terminal with no router pre-binding. Do Step 2-legacy + Step 3.
+(Retained during the pane-keying migration; removed in the clean cutover.)
+
+#### Step 2-legacy: get a forum topic (only if not already bound)
 
 **First check for compaction-replacement (attach) mode.** If the env var
 `TELEGRAM_BRIDGE_ATTACH_THREAD` is set, this session is a replacement for a topic
@@ -81,7 +112,6 @@ whose previous session ran out of context (see "Auto-compaction" below). In that
 case **do NOT create a topic** — reuse the existing one:
 
 ```bash
-CHAT_ID=$(python3 -c "import json;print(json.load(open('$HOME/.local/state/telegram-bridge/state.json'))['chat_id'])")
 if [ -n "${TELEGRAM_BRIDGE_ATTACH_THREAD:-}" ]; then
   THREAD_ID="$TELEGRAM_BRIDGE_ATTACH_THREAD"
   echo "attach mode: reusing existing topic $THREAD_ID"
@@ -110,7 +140,10 @@ PY
 
 Capture the printed `message_thread_id` as `THREAD_ID`.
 
-### Step 3: Register ownership (with this session's transcript)
+### Step 3: Register ownership (legacy self-bind — SKIP if already bound)
+
+> Skip this entire step if Step 2 found you already bound. It runs only on the
+> legacy fallback path (a hand-run `/telegram` with no router/spawn pre-binding).
 
 Write `~/.local/state/telegram-bridge/registry/<THREAD_ID>.json` so the daemon routes
 this topic's messages to this session's inbox. The registry also records this
@@ -212,9 +245,10 @@ with it). As a safety net the router unsets `@telegram_thread_id` on any pane in
 `DEAD`-renamed window each sweep, so a missed in-session clear can't leave a stale
 binding that mis-resolves a reused pane.
 
-(Migration note: this session-side stamp is the canary step. The eventual design
-stamps the pane programmatically from the spawn/router so binding leaves the LLM
-entirely — see the reconciliation design doc.)
+(This session-side stamp now runs ONLY on the legacy fallback. Spawned and
+`/attach`-adopted sessions are stamped programmatically by the spawn script / router
+before this skill runs, so they never reach here — binding has left the LLM. This
+fallback is removed in the clean cutover.)
 
 ### Step 3.5: (attach mode only) complete the handoff handshake
 
