@@ -85,7 +85,45 @@ def test_write_registry_entry_defaults_spawned_false_and_no_pid(monkeypatch, tmp
     assert entry["claude_pid"] is None         # no pid given
 
 
-# --- _select_transcript_for_cwd (gauge backfill selection) -----------------
+# --- _select_transcript_by_pane (exact gauge backfill join) ----------------
+
+def test_select_transcript_by_pane_exact_match():
+    mod = _load_router()
+    # Two sessions in ONE cwd — cwd alone can't disambiguate, pane_id can.
+    records = [
+        {"cwd": "/repo", "pane_id": "%23", "transcript_path": "/t/old.jsonl"},
+        {"cwd": "/repo", "pane_id": "%24", "transcript_path": "/t/new.jsonl"},
+    ]
+    out = mod._select_transcript_by_pane(records, "%24", mtime_of=lambda p: 1.0)
+    assert out == "/t/new.jsonl"               # the replacement's pane, not the sibling
+
+
+def test_select_transcript_by_pane_none_pane_returns_empty():
+    mod = _load_router()
+    out = mod._select_transcript_by_pane(
+        [{"pane_id": "%1", "transcript_path": "/t/x.jsonl"}], None, mtime_of=lambda p: 1.0)
+    assert out == ""                           # no pane id -> no exact match
+
+
+def test_select_transcript_by_pane_newest_when_pane_reused():
+    mod = _load_router()
+    # A pane that ran two sessions in sequence: newest-mtime wins.
+    records = [
+        {"pane_id": "%9", "transcript_path": "/t/first.jsonl"},
+        {"pane_id": "%9", "transcript_path": "/t/second.jsonl"},
+    ]
+    mtimes = {"/t/first.jsonl": 10.0, "/t/second.jsonl": 99.0}
+    assert mod._select_transcript_by_pane(records, "%9", mtime_of=lambda p: mtimes[p]) == "/t/second.jsonl"
+
+
+def test_select_transcript_by_pane_no_match_returns_empty():
+    mod = _load_router()
+    out = mod._select_transcript_by_pane(
+        [{"pane_id": "%1", "transcript_path": "/t/x.jsonl"}], "%2", mtime_of=lambda p: 1.0)
+    assert out == ""
+
+
+# --- _select_transcript_for_cwd (legacy cwd fallback) ----------------------
 
 def test_select_transcript_newest_mtime_for_cwd():
     mod = _load_router()

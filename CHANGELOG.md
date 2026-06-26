@@ -23,9 +23,12 @@
   then send `/telegram-bridge`). The skill now DETECTS it's already bound and loads
   only the drain procedure; its self-bind remains as a guarded legacy fallback
   (removed in the clean cutover). Registry entries gain `pane_id`; the router
-  lazily backfills `transcript_path` (unknown at spawn time) from the SessionStart
-  self-record so the context gauge still starts.
-  (`runtime/telegram-spawn.sh`, `runtime/telegram-router.py`, `skill/telegram-bridge/SKILL.md`.)
+  lazily backfills `transcript_path` (unknown at spawn time) so the context gauge
+  still starts — matched to the session by an EXACT `pane_id` join (the SessionStart
+  hook now records `TMUX_PANE`), re-checked each sweep so a rollover re-points to the
+  replacement's transcript; cwd-newest is only a fallback for pre-`pane_id` records.
+  (`runtime/telegram-spawn.sh`, `runtime/telegram-router.py`, `skill/telegram-bridge/SKILL.md`,
+  `hooks/telegram-self-register.py`.)
 
 ### Fixed
 - **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The

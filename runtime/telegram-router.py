@@ -242,14 +242,41 @@ def _load_self_records():
     return recs
 
 
+def _select_transcript_by_pane(records, pane_id, mtime_of=None):
+    """Pick the transcript_path of the self-record whose pane_id matches, or "".
+
+    The EXACT join: the SessionStart hook records the session's TMUX_PANE, so this
+    binds a registry entry's transcript to its actual session even when sessions
+    share a cwd. tmux pane ids are unique per server lifetime, so a match is
+    unambiguous; the newest-mtime tiebreak covers a pane that ran two sessions in
+    sequence. Returns "" when pane_id is falsy or no record matches."""
+    if not pane_id:
+        return ""
+    if mtime_of is None:
+        mtime_of = os.path.getmtime
+    best_m, best = -1.0, ""
+    for rec in records:
+        if rec.get("pane_id") != pane_id:
+            continue
+        tp = rec.get("transcript_path")
+        if not tp:
+            continue
+        try:
+            m = mtime_of(tp)
+        except OSError:
+            continue
+        if m > best_m:
+            best_m, best = m, tp
+    return best
+
+
 def _select_transcript_for_cwd(records, cwd, mtime_of=None):
     """Pick the newest-mtime transcript_path among self-records matching cwd, or "".
 
-    Matched by cwd (the self-record's pid is the launcher, not the claude process,
-    so it can't disambiguate). cwd is not unique per session, but transcript_path
-    only drives the context gauge — not routing/gating, which use the exact pane
-    option — so the same-cwd heuristic is acceptable (and matches the pre-pane
-    skill's behavior). mtime_of is injectable for tests; a path that errors is
+    The FALLBACK for records that predate pane_id (or a session outside tmux). cwd
+    is not unique per session, but transcript_path only drives the context gauge —
+    not routing/gating, which use the exact pane option — so the heuristic is an
+    acceptable last resort. mtime_of is injectable for tests; a path that errors is
     skipped (a vanished transcript shouldn't win)."""
     if mtime_of is None:
         mtime_of = os.path.getmtime
@@ -1187,15 +1214,22 @@ def context_loop():
                     continue
                 if reg.get("thread_id") is None:
                     continue
-                # Backfill transcript_path: programmatic bind (spawn/attach) writes
-                # the entry before the transcript file exists, so the context gauge
-                # would stay dormant. Fill it from the newest-mtime self-record for
-                # this cwd, then persist (preserving pane_id/claude_pid/spawned).
-                # Guarded by "not set", so it costs one self-dir scan only until filled.
-                if not reg.get("transcript_path"):
-                    _tp = _select_transcript_for_cwd(_load_self_records(), reg.get("cwd", ""))
-                    if _tp:
-                        reg["transcript_path"] = _tp
+                # Backfill transcript_path: the programmatic bind (spawn/attach)
+                # writes the entry before the transcript file exists, so the gauge
+                # would stay dormant. Prefer the EXACT pane_id match (re-checked each
+                # sweep so a rollover — new pane, new transcript — re-points even if an
+                # earlier sweep made a cwd guess); fall back to cwd-newest only until a
+                # pane match exists. Persisted preserving pane_id/claude_pid/spawned.
+                _recs = _load_self_records()
+                _pane_tp = _select_transcript_by_pane(_recs, reg.get("pane_id"))
+                if _pane_tp:
+                    if _pane_tp != reg.get("transcript_path"):
+                        reg["transcript_path"] = _pane_tp
+                        _persist_registry(tkey, reg)
+                elif not reg.get("transcript_path"):
+                    _cwd_tp = _select_transcript_for_cwd(_recs, reg.get("cwd", ""))
+                    if _cwd_tp:
+                        reg["transcript_path"] = _cwd_tp
                         _persist_registry(tkey, reg)
                 compute_status(reg, tkey)
                 # Clear a stale poll.lock.d / compacting.lock first, so a dead or
