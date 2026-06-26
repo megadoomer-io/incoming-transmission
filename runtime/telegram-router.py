@@ -69,7 +69,12 @@ CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
 CONFIG_FILE = BRIDGE_DIR / "compaction.json"
 CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    "context_interval_seconds": 90, "backstop_seconds": 300,
-                   "wedge_dwell_seconds": 300}
+                   "wedge_dwell_seconds": 300,
+                   # Diagnostic: when true, log the raw JSON of every getUpdates
+                   # result before dispatch. Read live each batch so it can be
+                   # toggled in compaction.json without a restart. Used to answer
+                   # OQ1 (do forum_topic_closed/reopened service messages arrive?).
+                   "debug_raw_updates": False}
 
 LONG_POLL_SECONDS = 30
 # socket timeout must exceed the long-poll window so the connection isn't torn
@@ -1909,6 +1914,12 @@ def main():
             continue
 
         updates = resp.get("result", [])
+        # OQ1 diagnostic: dump raw update JSON when debug_raw_updates is set. Read
+        # live (only when a batch arrives, so empty long-polls cost nothing) so the
+        # flag can be flipped in compaction.json without restarting the router.
+        if updates and load_compaction_cfg().get("debug_raw_updates"):
+            for _u in updates:
+                log("RAW UPDATE: " + json.dumps(_u))
         for upd in updates:
             state["offset"] = upd["update_id"] + 1
             msg = upd.get("message")

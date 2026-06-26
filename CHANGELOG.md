@@ -30,6 +30,15 @@
   (`runtime/telegram-spawn.sh`, `runtime/telegram-router.py`, `skill/telegram-bridge/SKILL.md`,
   `hooks/telegram-self-register.py`.)
 
+- **Diagnostic: `debug_raw_updates` config flag.** When set in `compaction.json`
+  (read live per batch, default off, zero cost when off), the router logs the raw
+  JSON of every `getUpdates` result before dispatch. Added to answer OQ1 — and it
+  did: `forum_topic_created`/`closed`/`reopened` DO arrive as `message` updates
+  (the close message's `date` is the `closed_at` a TTL needs). They were invisible
+  before only because they're bot-authored and the owner-filter drops them, so a
+  future topic ledger must intercept `forum_topic_*` ahead of that drop.
+  (`runtime/telegram-router.py`.)
+
 ### Fixed
 - **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
   earlier dead-pid backstop only patched the permission hook; routing the AUQ
