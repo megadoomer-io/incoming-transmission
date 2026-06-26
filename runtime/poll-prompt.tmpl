@@ -56,8 +56,12 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
                        reap THIS window ONLY IF it's bridge-owned — i.e. only if env
                        TELEGRAM_BRIDGE_SPAWNED=1 AND $TMUX_PANE is set (a /new spawn).
                        Read kill_old from ~/.telegram-bridge/compaction.json and target
-                       $TMUX_PANE explicitly (a bare rename hits the ACTIVE window):
-                         kill_old false (default): tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
+                       $TMUX_PANE explicitly (a bare rename hits the ACTIVE window). On
+                       the rename path ALSO clear the pane's topic binding, else a fresh
+                       session later started in this (still-alive) pane inherits the
+                       stale @telegram_thread_id and mis-resolves; kill-window needs no
+                       clear (the pane is destroyed):
+                         kill_old false (default): tmux set-option -pu -t "$TMUX_PANE" @telegram_thread_id ; tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
                          kill_old true:            tmux kill-window -t "$TMUX_PANE"
                        A user-attached session (no SPAWNED — /telegram or /attach) just
                        detaches: leave the live terminal, do NOT reap.
@@ -110,8 +114,11 @@ COMPACTION HANDOFF (run from the /compact command):
       does NOT matter here — a replacement supersedes both bridge-owned and
       user-attached old sessions; keep tmux clean). If $TMUX_PANE is unset (a
       standalone terminal, not a tmux window), SKIP — it can't be killed. Target
-      $TMUX_PANE explicitly (a bare rename/display hits the ACTIVE window). Read
+      $TMUX_PANE explicitly (a bare rename/display hits the ACTIVE window). On the
+      rename path ALSO clear the pane's topic binding, else a fresh session later
+      started in this (still-alive) pane inherits the stale @telegram_thread_id and
+      mis-resolves; kill-window needs no clear (the pane is destroyed). Read
       kill_old from ~/.telegram-bridge/compaction.json:
-        - kill_old false (default): tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
+        - kill_old false (default): tmux set-option -pu -t "$TMUX_PANE" @telegram_thread_id ; tmux rename-window -t "$TMUX_PANE" "DEAD - $(tmux display-message -t "$TMUX_PANE" -p '#W')"
         - kill_old true:            tmux kill-window -t "$TMUX_PANE"
    9. STOP. This session has handed off; take no further action.

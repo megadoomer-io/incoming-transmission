@@ -20,6 +20,13 @@
   resolvers through the shared resolver closes the same latent mis-route in both
   (a fresh session sharing a dead session's cwd is no longer gated against the
   stale topic). (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
+- **A reaped pane no longer keeps its topic binding.** The default reap path
+  (`kill_old=false`) renames the retired window `DEAD - <name>` but leaves the
+  pane alive, so its `@telegram_thread_id` stamp lingered — a fresh session later
+  started in that pane would inherit it and resolve to the dead topic. The reap
+  now also `set-option -pu`s the binding, and the router unsets it on any pane in a
+  `DEAD`-renamed window each sweep as a backstop against a missed in-session clear.
+  (`runtime/poll-prompt.tmpl`, `runtime/telegram-router.py`.)
 
 ## Unreleased — router-integrated wedge auto-clear
 

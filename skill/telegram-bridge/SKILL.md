@@ -204,6 +204,14 @@ not in tmux:
 [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @telegram_thread_id "$THREAD_ID" || true
 ```
 
+The binding is cleared at the other end of the lifecycle: on reap, the default
+`kill_old=false` path renames the retired window `DEAD - <name>` but leaves the
+pane alive, so it also runs `tmux set-option -pu -t "$TMUX_PANE" @telegram_thread_id`
+to drop the stamp (a `kill_old=true` kill-window destroys the pane and its option
+with it). As a safety net the router unsets `@telegram_thread_id` on any pane in a
+`DEAD`-renamed window each sweep, so a missed in-session clear can't leave a stale
+binding that mis-resolves a reused pane.
+
 (Migration note: this session-side stamp is the canary step. The eventual design
 stamps the pane programmatically from the spawn/router so binding leaves the LLM
 entirely — see the reconciliation design doc.)
@@ -355,7 +363,7 @@ the ultimate safety net if the router's detection is ever down.
 | `warn_pct` | `0.75` | Show ⚠️ on the sticky at this fraction |
 | `backstop_seconds` | `300` | Min interval between router re-nudges of an undrained inbox (the missed-push backstop) |
 | `context_interval_seconds` | `90` | How often the router recomputes each gauge, checks the trigger, and checks for undrained inboxes |
-| `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` (find + clean up by hand); `true` kills it |
+| `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (find + clean up by hand); `true` kills the window outright |
 
 Trigger it manually with `/compact` from the topic; check the gauge any time with
 `/context`.
@@ -541,7 +549,9 @@ gated despite a global Bash allowlist. (NOTE: the gate is bridge-MEMBERSHIP, not
   answering.
 - **Handoff window retirement is tmux-only**: the `DEAD - <name>` rename / kill on
   compaction applies to spawned sessions (which run in the shared `claude` tmux
-  session). A manually-attached session in a plain terminal still saves, spawns the
+  session). The rename path also clears the pane's `@telegram_thread_id` binding
+  (and the router backstops any miss), so a retired pane never mis-resolves. A
+  manually-attached session in a plain terminal still saves, spawns the
   replacement, and hands off, but the old terminal session is left for you to `/end`
   or close yourself.
 - **AskUserQuestion answer shape**: a spawned session asks via the

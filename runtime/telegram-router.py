@@ -736,6 +736,41 @@ def list_unattached_claude_panes():
     return [p for p in claude_panes if p[0] not in bridged]
 
 
+def _stale_pane_ids(list_panes_output):
+    """Pure: given `list-panes -F "#{pane_id}\\t#{window_name}\\t#{@telegram_thread_id}"`
+    output, return the pane ids whose window is DEAD-renamed but still carry the
+    @telegram_thread_id binding. Split out from the tmux call so it's unit-testable
+    without a live server. The window name is bridge-controlled (`DEAD - <name>`),
+    the option value is a numeric thread id — neither contains a tab — so a 3-field
+    tab split is safe; an unset option yields an empty third field and is skipped."""
+    stale = []
+    for line in list_panes_output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        pane_id, wname, opt = parts
+        if wname.startswith("DEAD") and opt:
+            stale.append(pane_id)
+    return stale
+
+
+def clear_stale_pane_options():
+    """Backstop the pane-keyed resolver's invariant: a pane carries
+    @telegram_thread_id ONLY while its bridge session is live. The default reap
+    path (kill_old=false) RENAMES a retired window to "DEAD - ..." but leaves the
+    pane — and its stamped option — alive, and the in-session clear on /end /
+    compaction is best-effort (a skipped step, or a session that died mid-reap,
+    leaves the option set). A lingering option would mis-bind a fresh process later
+    started in that pane. Here the router unsets it programmatically on any pane in
+    a DEAD-renamed window. Idempotent, cheap (one list-panes per sweep), never
+    raises. (kill_old=true destroys the pane, so its option is already gone.)"""
+    out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+                "-F", "#{pane_id}\t#{window_name}\t#{@telegram_thread_id}")
+    for pane_id in _stale_pane_ids(out):
+        _tmux("set-option", "-pu", "-t", pane_id, "@telegram_thread_id")
+        log("backstop: cleared stale @telegram_thread_id on DEAD pane {}".format(pane_id))
+
+
 def _nudge_pane(reg, text, kind):
     """Best-effort: send-keys a one-line instruction into the topic's pane (the
     pid-matched session). One line (no embedded newline) so Enter submits exactly
@@ -1028,6 +1063,10 @@ def context_loop():
         wedge_dwell = max(60, int(cfg.get("wedge_dwell_seconds", 300) or 300))
         # chat_id (for owner wedge alerts) read once per sweep — cheap small file.
         sweep_chat_id = load_state().get("chat_id")
+        # Backstop the pane-keyed binding once per sweep: unset @telegram_thread_id
+        # on any DEAD-renamed pane whose in-session clear was missed, so a reused
+        # pane can't mis-resolve to a retired topic. Pane-level, not per-topic.
+        clear_stale_pane_options()
         if REGISTRY_DIR.is_dir():
             for f in REGISTRY_DIR.glob("*.json"):
                 tkey = f.stem
