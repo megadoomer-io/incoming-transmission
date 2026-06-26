@@ -280,7 +280,7 @@ Early release. Beyond the [Caveats](#caveats), these specific items are known:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds` |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds`; topic reaper: `topic_reaper_enabled` (default off — `deleteForumTopic` is irreversible), `topic_ttl_seconds` (default 7d), `topic_reap_interval_seconds` |
 | `permissions.json` | bridge-session permission posture: `risk-tiered` (default), `ask`, or `auto-allow` |
 | `spawned-allow.json` | persisted "always allow" rules (grown by the hook on ✅ Always allow; auditable JSON) |
 | `lifecycle/{style,start,save,end}.txt` | per-event behavior hooks (read live; gitignored). See [Customizing agent behavior](#customizing-agent-behavior) |

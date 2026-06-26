@@ -5,5 +5,8 @@
   "backstop_seconds": 300,
   "context_interval_seconds": 90,
   "poll_lock_ttl_seconds": 1800,
-  "handoff_lock_ttl_seconds": 600
+  "handoff_lock_ttl_seconds": 600,
+  "topic_reaper_enabled": false,
+  "topic_ttl_seconds": 604800,
+  "topic_reap_interval_seconds": 3600
 }

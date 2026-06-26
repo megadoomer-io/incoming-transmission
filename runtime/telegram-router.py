@@ -50,6 +50,11 @@ REGISTRY_DIR = STATE_DIR / "registry"
 # Per-topic pinned-status ("sticky") bookkeeping, owned exclusively by this
 # daemon so it never races the /telegram skill's registry writes.
 STICKY_DIR = STATE_DIR / "sticky"
+# Topic lifecycle ledger: thread_id -> {name, state, created_at, closed_at}. Fed by
+# forum_topic_* service messages (OQ1: they arrive as bot-authored `message`
+# updates), it's the durable record of which topics exist and when each was closed,
+# which the opt-in reaper uses to TTL-delete long-closed topics ("tidy forum").
+TOPICS_LEDGER = STATE_DIR / "topics.json"
 # message_id -> topic index. A message_reaction update carries no
 # message_thread_id, so to route a reaction back to its session we look the
 # reacted message_id up here. Append-only JSONL written by BOTH this router
@@ -72,6 +77,20 @@ CONFIG_FILE = BRIDGE_DIR / "compaction.json"
 CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    "context_interval_seconds": 90, "backstop_seconds": 300,
                    "wedge_dwell_seconds": 300,
+                   # Stale-lock TTLs the context loop reads (issue #8). Listed here
+                   # so load_compaction_cfg actually carries them through from the
+                   # file — its key filter drops anything not in CONFIG_DEFAULTS, so
+                   # without these the shipped compaction.json values were ignored
+                   # and only the context_loop inline fallbacks (same numbers) ran.
+                   "poll_lock_ttl_seconds": 1800, "handoff_lock_ttl_seconds": 600,
+                   # Topic reaper ("tidy forum"): TTL-delete forum topics that have
+                   # been CLOSED longer than topic_ttl_seconds, so ended/rolled-over
+                   # sessions don't pile up closed topics forever. Opt-in because
+                   # deleteForumTopic is irreversible; the lifecycle LEDGER that
+                   # feeds it (topics.json, fed by forum_topic_* events — OQ1) is
+                   # always on. reap_interval throttles the sweep well below the TTL.
+                   "topic_reaper_enabled": False, "topic_ttl_seconds": 604800,
+                   "topic_reap_interval_seconds": 3600,
                    # Diagnostic: when true, log the raw JSON of every getUpdates
                    # result before dispatch. Read live each batch so it can be
                    # toggled in compaction.json without a restart. Used to answer
@@ -104,6 +123,11 @@ _caffeinate = None  # Popen handle for the keep-awake child
 # the GIL; this is best-effort throttling, so the rare cross-thread race (one
 # extra or one skipped nudge) is harmless.
 _backstop_nudged_at = {}
+# Topic reaper throttle: monotonic timestamp of the last reap sweep, so the
+# context loop runs it at most once per topic_reap_interval_seconds (the TTL is
+# days; sweeping every ~90s would be wasteful). Module-global so a router restart
+# re-arms a fresh interval.
+_last_topic_reap = 0.0
 # Wedge tracking: tkey -> {"sig": <prompt signature>, "first_seen": <monotonic>,
 # "acted": <bool>}. A bridged session can wedge on a native blocking prompt the
 # bridge can't answer remotely (a native AskUserQuestion menu, a trust-folder
@@ -1259,6 +1283,17 @@ def context_loop():
                 # pane and may transiently look like a prompt).
                 if not lock.exists():
                     handle_wedge(reg, tkey, sweep_chat_id, wedge_dwell)
+        # Topic reaper ("tidy forum"): TTL-delete forum topics closed longer than
+        # the TTL so ended/rolled-over sessions don't pile up closed topics. Opt-in
+        # (deleteForumTopic is irreversible) and throttled well below the TTL, so
+        # most sweeps are a cheap timestamp check that does nothing.
+        if cfg.get("topic_reaper_enabled"):
+            global _last_topic_reap
+            reap_every = max(300, int(cfg.get("topic_reap_interval_seconds", 3600) or 3600))
+            if (time.monotonic() - _last_topic_reap) >= reap_every:
+                ttl = max(3600, int(cfg.get("topic_ttl_seconds", 604800) or 604800))
+                reap_topics(sweep_chat_id, ttl)
+                _last_topic_reap = time.monotonic()
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:
@@ -1306,6 +1341,130 @@ def inject_inbox_note(reg, text, from_id, username):
         return False
 
 
+# --- topic lifecycle ledger + reaper ("tidy forum") ------------------------
+#
+# OQ1 confirmed forum_topic_created/closed/reopened arrive in getUpdates as
+# bot-authored `message` service updates (the close message's `date` IS the
+# closed_at a TTL needs). They're intercepted in handle_message AHEAD of the
+# owner-filter (which would drop them as not-from-owner) and folded into a small
+# ledger keyed by thread id. The opt-in reaper then deleteForumTopic's any topic
+# closed longer than the TTL, so ended/rolled-over sessions don't leave the forum
+# cluttered with closed topics. Topics created before the ledger shipped aren't
+# tracked (no event was ever recorded for them) — tidy those once by hand; the
+# reaper keeps it clean from here on.
+
+FORUM_TOPIC_KEYS = ("forum_topic_created", "forum_topic_closed",
+                    "forum_topic_reopened", "forum_topic_edited")
+
+
+def load_ledger():
+    """The topic ledger dict (thread_id str -> record), or {} if absent/corrupt."""
+    try:
+        data = json.loads(TOPICS_LEDGER.read_text())
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def save_ledger(ledger):
+    """Atomically persist the ledger. Best-effort; never raises into a caller."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TOPICS_LEDGER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ledger, indent=2))
+        tmp.replace(TOPICS_LEDGER)
+    except OSError as e:
+        log("WARN save_ledger: {}".format(e))
+
+
+def record_topic_event(msg, thread_id):
+    """Fold one forum_topic_* service message into the ledger. Timestamps come from
+    the message `date` (epoch) — for a close that IS closed_at, which the reaper
+    ages against. Best-effort: a bad/partial event never breaks the update pump."""
+    try:
+        tkey = str(thread_id)
+        when = int(msg.get("date") or 0) or int(time.time())
+        ledger = load_ledger()
+        rec = ledger.get(tkey) or {"thread_id": int(thread_id)}
+        if "forum_topic_created" in msg:
+            name = (msg.get("forum_topic_created") or {}).get("name")
+            if name:
+                rec["name"] = name
+            rec["created_at"] = rec.get("created_at") or when
+            rec["state"] = "open"
+            rec["closed_at"] = None
+        elif "forum_topic_closed" in msg:
+            rec["state"] = "closed"
+            rec["closed_at"] = when
+        elif "forum_topic_reopened" in msg:
+            rec["state"] = "open"
+            rec["closed_at"] = None
+        elif "forum_topic_edited" in msg:
+            name = (msg.get("forum_topic_edited") or {}).get("name")
+            if name:
+                rec["name"] = name
+        else:
+            return  # not a lifecycle event we track
+        ledger[tkey] = rec
+        save_ledger(ledger)
+        log("ledger: topic {} -> {}".format(tkey, rec.get("state")))
+    except (ValueError, TypeError) as e:
+        log("WARN record_topic_event: {}".format(e))
+
+
+def _topics_to_reap(ledger, now_epoch, ttl_seconds):
+    """Pure: thread-id keys whose topic has been CLOSED at least ttl_seconds ago.
+    Open topics, and closed ones still within the TTL, are kept; a closed entry
+    with no closed_at is skipped (it can't be aged). Split out so the reap policy
+    is unit-testable without the Telegram API."""
+    out = []
+    for tkey, rec in (ledger or {}).items():
+        if not isinstance(rec, dict) or rec.get("state") != "closed":
+            continue
+        closed_at = rec.get("closed_at")
+        if not closed_at:
+            continue
+        try:
+            if (now_epoch - int(closed_at)) >= ttl_seconds:
+                out.append(tkey)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def delete_forum_topic(chat_id, thread_id):
+    """deleteForumTopic — permanently remove a forum topic and its messages.
+    Best-effort; returns True only on an ok response so the reaper can keep a
+    failed entry for a later retry instead of dropping it from the ledger."""
+    try:
+        r = api_call("deleteForumTopic",
+                     {"chat_id": chat_id, "message_thread_id": thread_id})
+        return bool(r.get("ok"))
+    except (urllib.error.URLError, OSError) as e:
+        log("WARN deleteForumTopic {}: {}".format(thread_id, e))
+        return False
+
+
+def reap_topics(chat_id, ttl_seconds):
+    """Delete every topic closed longer than ttl_seconds and drop it from the
+    ledger. No-op without a chat_id. A topic whose delete fails stays in the ledger
+    (retried next sweep). Caller gates this on topic_reaper_enabled."""
+    if chat_id is None:
+        return
+    ledger = load_ledger()
+    doomed = _topics_to_reap(ledger, int(time.time()), ttl_seconds)
+    if not doomed:
+        return
+    changed = False
+    for tkey in doomed:
+        if delete_forum_topic(chat_id, int(tkey)):
+            ledger.pop(tkey, None)
+            changed = True
+            log("reaper: deleted long-closed topic {} (ttl {}s)".format(tkey, ttl_seconds))
+    if changed:
+        save_ledger(ledger)
+
+
 def handle_message(msg, state):
     chat = msg.get("chat", {})
     frm = msg.get("from", {})
@@ -1331,6 +1490,16 @@ def handle_message(msg, state):
         image_file_id = doc.get("file_id")
 
     if from_id is None or chat_id is None:
+        return
+
+    # --- topic lifecycle ledger ---
+    # forum_topic_* are bot-authored service messages (OQ1), so they MUST be folded
+    # into the ledger here, ahead of the owner-filter below that would drop them as
+    # not-from-owner. Scoped to the control chat (or pre-bootstrap, when chat_id is
+    # still unset). Recording is the whole job — these are never tasks or commands.
+    if thread_id is not None and any(k in msg for k in FORUM_TOPIC_KEYS):
+        if state.get("chat_id") in (None, chat_id):
+            record_topic_event(msg, thread_id)
         return
 
     # --- bootstrap: first message from the expected owner claims the bridge ---

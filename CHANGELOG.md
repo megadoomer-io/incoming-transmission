@@ -65,6 +65,17 @@
   one bind helper (`_attach_one`), so both run identical logic.
   (`runtime/telegram-router.py`.)
 
+- **Topic lifecycle ledger + reaper ("tidy forum").** Building on OQ1
+  (`forum_topic_*` arrive as bot-authored `message` updates), the router now folds
+  those events into a `topics.json` ledger — intercepted ahead of the owner-filter
+  that would drop them — recording each topic's state and `closed_at` (the close
+  message's `date`). An opt-in reaper (`topic_reaper_enabled`, off by default since
+  `deleteForumTopic` is irreversible) runs on the context-loop timer, throttled to
+  `topic_reap_interval_seconds`, and deletes any topic closed longer than
+  `topic_ttl_seconds` (default 7d), so ended and rolled-over sessions stop piling up
+  closed topics. Pure `_topics_to_reap` carries the aging policy.
+  (`runtime/telegram-router.py`, `runtime/compaction.json`.)
+
 ### Removed
 - **Clean cutover: the resolver's cwd fallback is gone.** With binding now
   programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
@@ -78,6 +89,12 @@
   `runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
 
 ### Fixed
+- **`poll_lock_ttl_seconds` / `handoff_lock_ttl_seconds` from `compaction.json` are
+  now honored.** `load_compaction_cfg` only carries through keys present in
+  `CONFIG_DEFAULTS`, and these two weren't — so the shipped file values were
+  silently dropped and only the context-loop inline fallbacks ran. Added both to
+  `CONFIG_DEFAULTS` (same numbers, so no behavior change), making the config keys
+  live. (`runtime/telegram-router.py`.)
 - **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
   earlier dead-pid backstop only patched the permission hook; routing the AUQ
   resolvers through the shared resolver closes the same latent mis-route in both
