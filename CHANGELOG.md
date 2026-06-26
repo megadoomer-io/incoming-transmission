@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased — pane-keyed session↔topic resolution (Phase 1)
+
+### Changed
+- **All three resolvers now share `bridge_resolve`, keyed on the tmux pane.** The
+  permission hook, the AskUserQuestion MCP server, and the AskUserQuestion hook
+  each carried their own near-identical copy that resolved a session's topic by
+  cwd. cwd is not unique per session — two Claudes in one repo share it — so a
+  shared cwd could route one session's prompts to the other's topic. They now
+  call `bridge_resolve.resolve()`, which keys on the `@telegram_thread_id` pane
+  option (authoritative) and the `TELEGRAM_BRIDGE_THREAD_ID` spawn env
+  (race-free), with a cwd fallback retained for sessions bound before the
+  migration. (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`;
+  resolver added earlier in `runtime/bridge_resolve.py`.)
+- **Binding moved off the LLM — programmatic topic creation, registration, and
+  pane stamping.** Creating the forum topic, writing `registry/<thread>.json`, and
+  stamping `@telegram_thread_id` used to run in the skill (the model). Now the
+  spawn script does it for `/new` and compaction rollover (it creates/reuses the
+  topic, injects the race-free `TELEGRAM_BRIDGE_THREAD_ID`, captures the new pane id,
+  stamps the option, and writes the registry — carrying `spawned` forward on
+  rollover), and the router does it for `/attach` (create topic, stamp, register,
+  then send `/telegram-bridge`). The skill now DETECTS it's already bound and loads
+  only the drain procedure; its self-bind remains as a guarded legacy fallback
+  (removed in the clean cutover). Registry entries gain `pane_id`; the router
+  lazily backfills `transcript_path` (unknown at spawn time) so the context gauge
+  still starts — matched to the session by an EXACT `pane_id` join (the SessionStart
+  hook now records `TMUX_PANE`), re-checked each sweep so a rollover re-points to the
+  replacement's transcript; cwd-newest is only a fallback for pre-`pane_id` records.
+  (`runtime/telegram-spawn.sh`, `runtime/telegram-router.py`, `skill/telegram-bridge/SKILL.md`,
+  `hooks/telegram-self-register.py`.)
+
+- **Diagnostic: `debug_raw_updates` config flag.** When set in `compaction.json`
+  (read live per batch, default off, zero cost when off), the router logs the raw
+  JSON of every `getUpdates` result before dispatch. Added to answer OQ1 — and it
+  did: `forum_topic_created`/`closed`/`reopened` DO arrive as `message` updates
+  (the close message's `date` is the `closed_at` a TTL needs). They were invisible
+  before only because they're bot-authored and the owner-filter drops them, so a
+  future topic ledger must intercept `forum_topic_*` ahead of that drop.
+  (`runtime/telegram-router.py`.)
+
+- **Shared programmatic bind (`bridge_bind.py`) + keyboard `/telegram` self-bind.**
+  Extracted the bind primitives (create topic, stamp pane, write registry) into one
+  stdlib module, the write-side counterpart to `bridge_resolve`. The router's
+  `/attach` now calls `bridge_bind.bind_pane` instead of its own copies, and a new
+  self-bind CLI (`python3 bridge_bind.py`, binds `$TMUX_PANE`) lets a keyboard
+  `/telegram` bind programmatically — same `bind_pane`, no LLM-run createForumTopic
+  or registry heredoc. The SKILL.md legacy heredoc is gone; its not-bound branch is
+  now a one-line CLI call. One bind implementation, three entry points (spawn,
+  router, keyboard). (`runtime/bridge_bind.py`, `runtime/telegram-router.py`,
+  `skill/telegram-bridge/SKILL.md`.)
+
+- **`/attach` lists candidates by cwd basename, not the window name (issue #17).**
+  With `automatic-rename` on, the window name tracks the foreground process, so the
+  list read `zsh`, `zsh`, `zsh` — useless. Claude Code's pane title is a volatile,
+  spinner-prefixed activity line, also no good as a stable handle. The list now
+  labels each candidate with the cwd basename (`incoming-transmission`, `joey`), the
+  project name you actually pick a session by; selectors match that label or the
+  window index. (`runtime/telegram-router.py` — new `_pane_label`.)
+
+### Added
+- **`/attach all` — bulk-adopt every unattached session.** Binds each candidate in
+  one command (loop create-topic + stamp + register + send-keys), reporting the
+  roster of topics opened and any that failed. The single and bulk paths now share
+  one bind helper (`_attach_one`), so both run identical logic.
+  (`runtime/telegram-router.py`.)
+
+- **Topic lifecycle ledger + reaper ("tidy forum").** Building on OQ1
+  (`forum_topic_*` arrive as bot-authored `message` updates), the router now folds
+  those events into a `topics.json` ledger — intercepted ahead of the owner-filter
+  that would drop them — recording each topic's state and `closed_at` (the close
+  message's `date`). An opt-in reaper (`topic_reaper_enabled`, off by default since
+  `deleteForumTopic` is irreversible) runs on the context-loop timer, throttled to
+  `topic_reap_interval_seconds`, and deletes any topic closed longer than
+  `topic_ttl_seconds` (default 7d), so ended and rolled-over sessions stop piling up
+  closed topics. Pure `_topics_to_reap` carries the aging policy.
+  (`runtime/telegram-router.py`, `runtime/compaction.json`.)
+
+### Removed
+- **Clean cutover: the resolver's cwd fallback is gone.** With binding now
+  programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
+  `bridge_resolve.resolve()` is pane-keyed only — pane option then spawn env, no
+  cwd. Deleted `resolve_topic_cwd_fallback` and its `_pid_alive` /
+  `_claude_ancestor_pid` helpers, the `cwd_fallback`/`cwd`/`registry_dir` params,
+  and the now-dead cwd-keyed `find_topic` (+ helpers) still sitting in the
+  permission hook. The three callers call `resolve()` with no cwd. A pane with no
+  `@telegram_thread_id` is, by definition, not a bridge session.
+  (`runtime/bridge_resolve.py`, `runtime/telegram-permission-hook.py`,
+  `runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
+
+### Fixed
+- **`poll_lock_ttl_seconds` / `handoff_lock_ttl_seconds` from `compaction.json` are
+  now honored.** `load_compaction_cfg` only carries through keys present in
+  `CONFIG_DEFAULTS`, and these two weren't — so the shipped file values were
+  silently dropped and only the context-loop inline fallbacks ran. Added both to
+  `CONFIG_DEFAULTS` (same numbers, so no behavior change), making the config keys
+  live. (`runtime/telegram-router.py`.)
+- **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
+  earlier dead-pid backstop only patched the permission hook; routing the AUQ
+  resolvers through the shared resolver closes the same latent mis-route in both
+  (a fresh session sharing a dead session's cwd is no longer gated against the
+  stale topic). (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
+- **A reaped pane no longer keeps its topic binding.** The default reap path
+  (`kill_old=false`) renames the retired window `DEAD - <name>` but leaves the
+  pane alive, so its `@telegram_thread_id` stamp lingered — a fresh session later
+  started in that pane would inherit it and resolve to the dead topic. The reap
+  now also `set-option -pu`s the binding, and the router unsets it on any pane in a
+  `DEAD`-renamed window each sweep as a backstop against a missed in-session clear.
+  (`runtime/poll-prompt.tmpl`, `runtime/telegram-router.py`.)
+
 ## Unreleased — router-integrated wedge auto-clear
 
 ### Changed

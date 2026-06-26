@@ -67,8 +67,12 @@ def main() -> None:
         "session_id": session_id,
         "transcript_path": transcript,
         "cwd": cwd,
+        # This session's tmux pane (inherited from the pane env). It's the EXACT
+        # join key the router's gauge backfill uses to bind a registry entry's
+        # transcript — unambiguous even when sessions share a cwd. None outside tmux.
+        "pane_id": os.environ.get("TMUX_PANE") or None,
         # getppid() is the launcher (uv/env), not the claude process, so it is NOT
-        # a reliable liveness signal — selection uses transcript mtime instead.
+        # a reliable liveness signal — kept only for diagnostics.
         "pid": os.getppid(),
         "source": payload.get("source"),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

@@ -38,6 +38,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import bridge_bind  # shared programmatic bind (create topic + stamp pane + register)
+
 TOKEN = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN", "")
 API = "https://api.telegram.org/bot{}/{}".format(TOKEN, "{}")
 
@@ -48,6 +50,11 @@ REGISTRY_DIR = STATE_DIR / "registry"
 # Per-topic pinned-status ("sticky") bookkeeping, owned exclusively by this
 # daemon so it never races the /telegram skill's registry writes.
 STICKY_DIR = STATE_DIR / "sticky"
+# Topic lifecycle ledger: thread_id -> {name, state, created_at, closed_at}. Fed by
+# forum_topic_* service messages (OQ1: they arrive as bot-authored `message`
+# updates), it's the durable record of which topics exist and when each was closed,
+# which the opt-in reaper uses to TTL-delete long-closed topics ("tidy forum").
+TOPICS_LEDGER = STATE_DIR / "topics.json"
 # message_id -> topic index. A message_reaction update carries no
 # message_thread_id, so to route a reaction back to its session we look the
 # reacted message_id up here. Append-only JSONL written by BOTH this router
@@ -69,7 +76,26 @@ CONTEXT_SCRIPT = BRIDGE_DIR / "telegram-context.py"
 CONFIG_FILE = BRIDGE_DIR / "compaction.json"
 CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    "context_interval_seconds": 90, "backstop_seconds": 300,
-                   "wedge_dwell_seconds": 300}
+                   "wedge_dwell_seconds": 300,
+                   # Stale-lock TTLs the context loop reads (issue #8). Listed here
+                   # so load_compaction_cfg actually carries them through from the
+                   # file — its key filter drops anything not in CONFIG_DEFAULTS, so
+                   # without these the shipped compaction.json values were ignored
+                   # and only the context_loop inline fallbacks (same numbers) ran.
+                   "poll_lock_ttl_seconds": 1800, "handoff_lock_ttl_seconds": 600,
+                   # Topic reaper ("tidy forum"): TTL-delete forum topics that have
+                   # been CLOSED longer than topic_ttl_seconds, so ended/rolled-over
+                   # sessions don't pile up closed topics forever. Opt-in because
+                   # deleteForumTopic is irreversible; the lifecycle LEDGER that
+                   # feeds it (topics.json, fed by forum_topic_* events — OQ1) is
+                   # always on. reap_interval throttles the sweep well below the TTL.
+                   "topic_reaper_enabled": False, "topic_ttl_seconds": 604800,
+                   "topic_reap_interval_seconds": 3600,
+                   # Diagnostic: when true, log the raw JSON of every getUpdates
+                   # result before dispatch. Read live each batch so it can be
+                   # toggled in compaction.json without a restart. Used to answer
+                   # OQ1 (do forum_topic_closed/reopened service messages arrive?).
+                   "debug_raw_updates": False}
 
 LONG_POLL_SECONDS = 30
 # socket timeout must exceed the long-poll window so the connection isn't torn
@@ -97,6 +123,11 @@ _caffeinate = None  # Popen handle for the keep-awake child
 # the GIL; this is best-effort throttling, so the rare cross-thread race (one
 # extra or one skipped nudge) is harmless.
 _backstop_nudged_at = {}
+# Topic reaper throttle: monotonic timestamp of the last reap sweep, so the
+# context loop runs it at most once per topic_reap_interval_seconds (the TTL is
+# days; sweeping every ~90s would be wasteful). Module-global so a router restart
+# re-arms a fresh interval.
+_last_topic_reap = 0.0
 # Wedge tracking: tkey -> {"sig": <prompt signature>, "first_seen": <monotonic>,
 # "acted": <bool>}. A bridged session can wedge on a native blocking prompt the
 # bridge can't answer remotely (a native AskUserQuestion menu, a trust-folder
@@ -178,6 +209,90 @@ def load_registry(tkey):
         except (ValueError, OSError):
             return None
     return None
+
+
+def _persist_registry(tkey, reg):
+    """Atomically write a (possibly mutated) registry entry dict back. Used by the
+    context-loop backfill, which updates an already-loaded entry in place (so it
+    preserves pane_id/claude_pid/spawned, unlike a full bridge_bind rebuild)."""
+    try:
+        path = REGISTRY_DIR / "{}.json".format(tkey)
+        tmp = REGISTRY_DIR / "{}.json.tmp".format(tkey)
+        tmp.write_text(json.dumps(reg, indent=2))
+        os.replace(str(tmp), str(path))
+        return True
+    except OSError as e:
+        log("ERROR persist registry {}: {}".format(tkey, e))
+        return False
+
+
+def _load_self_records():
+    """All SessionStart self-records (self/*.json), written by the
+    telegram-self-register hook. Each carries {transcript_path, cwd, ...}."""
+    recs = []
+    sd = STATE_DIR / "self"
+    if not sd.is_dir():
+        return recs
+    for f in sd.glob("*.json"):
+        try:
+            recs.append(json.loads(f.read_text()))
+        except (ValueError, OSError):
+            continue
+    return recs
+
+
+def _select_transcript_by_pane(records, pane_id, mtime_of=None):
+    """Pick the transcript_path of the self-record whose pane_id matches, or "".
+
+    The EXACT join: the SessionStart hook records the session's TMUX_PANE, so this
+    binds a registry entry's transcript to its actual session even when sessions
+    share a cwd. tmux pane ids are unique per server lifetime, so a match is
+    unambiguous; the newest-mtime tiebreak covers a pane that ran two sessions in
+    sequence. Returns "" when pane_id is falsy or no record matches."""
+    if not pane_id:
+        return ""
+    if mtime_of is None:
+        mtime_of = os.path.getmtime
+    best_m, best = -1.0, ""
+    for rec in records:
+        if rec.get("pane_id") != pane_id:
+            continue
+        tp = rec.get("transcript_path")
+        if not tp:
+            continue
+        try:
+            m = mtime_of(tp)
+        except OSError:
+            continue
+        if m > best_m:
+            best_m, best = m, tp
+    return best
+
+
+def _select_transcript_for_cwd(records, cwd, mtime_of=None):
+    """Pick the newest-mtime transcript_path among self-records matching cwd, or "".
+
+    The FALLBACK for records that predate pane_id (or a session outside tmux). cwd
+    is not unique per session, but transcript_path only drives the context gauge —
+    not routing/gating, which use the exact pane option — so the heuristic is an
+    acceptable last resort. mtime_of is injectable for tests; a path that errors is
+    skipped (a vanished transcript shouldn't win)."""
+    if mtime_of is None:
+        mtime_of = os.path.getmtime
+    target = os.path.realpath(cwd) if cwd else ""
+    best_m, best = -1.0, ""
+    for rec in records:
+        rc = rec.get("cwd")
+        tp = rec.get("transcript_path")
+        if not rc or not tp or os.path.realpath(rc) != target:
+            continue
+        try:
+            m = mtime_of(tp)
+        except OSError:
+            continue
+        if m > best_m:
+            best_m, best = m, tp
+    return best
 
 
 # --- message_id -> topic index (for routing reactions) ---------------------
@@ -526,7 +641,7 @@ def update_stickies(state):
 # a-z/0-9/_. Order = menu order.
 BRIDGE_COMMANDS = [
     ("new", "Spawn a new Claude session (dir/alias + optional intent note)"),
-    ("attach", "Adopt an existing unattached Claude session into a topic"),
+    ("attach", "Adopt an unattached Claude session into a topic (n | all)"),
     ("sessions", "List attached Claude sessions"),
     ("status", "This session: cwd + messages processed"),
     ("context", "This session: live context % gauge"),
@@ -615,9 +730,9 @@ HELP = (
     "/new [dir] [intent note] — spawn a NEW Claude session in dir (default: home) "
     "and auto-attach it to its own topic; any trailing text is an optional intent "
     "note the fresh session starts with\n"
-    "/attach [n|window] — adopt an existing, unattached Claude session in the tmux "
-    "session into its own topic (no arg lists candidates). Unlike /new, it's not "
-    "reaped on /end — just detached.\n"
+    "/attach [n|window|all] — adopt an existing, unattached Claude session in the "
+    "tmux session into its own topic (no arg lists candidates; `all` binds every "
+    "one). Unlike /new, it's not reaped on /end — just detached.\n"
     "/whoami  — show this chat id, your user id, and the current topic id\n"
     "/sessions — list Claude sessions attached to topics\n"
     "/help — this message\n\n"
@@ -699,21 +814,37 @@ def _pane_for_claude_pid(target_pid):
     return None
 
 
+def _pane_label(cwd, window_name):
+    """Friendly /attach label: the cwd basename ('incoming-transmission', 'joey').
+
+    With automatic-rename the window name tracks the foreground process ('zsh'), and
+    Claude Code sets the pane title to a volatile, spinner-prefixed activity line
+    ('⠂ Claude Code', '⠐ Deploy to infra-prod…') — so neither is a stable
+    identifier. The cwd basename names the project, which is what you actually pick a
+    session by (issue #17). Falls back to the window name only when the cwd is empty,
+    then a generic 'session'."""
+    base = os.path.basename((cwd or "").rstrip("/"))
+    return base or window_name or "session"
+
+
 def list_unattached_claude_panes():
     """Claude panes in the shared tmux session that are NOT already bridged — the
     candidates for /attach. A pane is a claude session if its `pane_current_command`
     is claude (an idle TUI; a session mid-tool may briefly read as `bash` and be
     missed — fine, /attach is for an idle session you're choosing to bind). "Already
     bridged" = some registry entry's claude_pid resolves (via _pane_for_claude_pid)
-    to that pane. Returns [(pane_id, window_index, window_name), ...]."""
+    to that pane. Returns [(pane_id, window_index, label), ...], where label is the
+    cwd basename (see _pane_label) — the readable project name you pick a session
+    by, not the (process-tracked) window name."""
     out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
-                "-F", "#{pane_id}\t#{window_index}\t#{window_name}\t#{pane_current_command}")
+                "-F", "#{pane_id}\t#{window_index}\t#{window_name}\t"
+                      "#{pane_current_command}\t#{pane_current_path}")
     claude_panes = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 4:
+        if len(parts) != 5:
             continue
-        pane_id, widx, wname, curcmd = parts
+        pane_id, widx, wname, curcmd, cwd = parts
         # Adopt only LIVE, user claude sessions in normally-named windows. Skip
         # bridge-managed windows (tg:* — the bridge's domain; an unregistered one is
         # a STALE bridge session, a #6 reap concern, not an adopt candidate) and
@@ -721,7 +852,7 @@ def list_unattached_claude_panes():
         if ("claude" in curcmd.lower()
                 and not wname.startswith("tg:")
                 and not wname.startswith("DEAD")):
-            claude_panes.append((pane_id, widx, wname))
+            claude_panes.append((pane_id, widx, _pane_label(cwd, wname)))
     bridged = set()
     if REGISTRY_DIR.is_dir():
         for f in REGISTRY_DIR.glob("*.json"):
@@ -734,6 +865,71 @@ def list_unattached_claude_panes():
                 if pane:
                     bridged.add(pane)
     return [p for p in claude_panes if p[0] not in bridged]
+
+
+def _attach_one(chat_id, target):
+    """Bind one unattached pane (an /attach candidate tuple) to a fresh topic, off
+    the LLM: resolve the pane's cwd + pid, create topic + stamp pane + write registry
+    via the shared bridge_bind.bind_pane, then send-keys /telegram-bridge so the
+    adopted session detects the already-set pane option and loads only the drain
+    procedure (no create/register/stamp). Returns the new thread_id, or None if the
+    topic couldn't be created (nothing stamped/written — no half-bind). Shared by
+    /attach <n> and /attach all so both run identical bind logic."""
+    pane_id = target[0]
+    # claude is the pane command (or a descendant), so storing the pane pid lets
+    # _pane_for_claude_pid match by walking UP from it.
+    cwd = _tmux("display-message", "-p", "-t", pane_id, "#{pane_current_path}").strip()
+    pane_pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
+    try:
+        branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        branch = ""
+    name = "{}@{}".format(os.path.basename(cwd) or "session", branch or "nogit")
+    new_tid = bridge_bind.bind_pane(TOKEN, chat_id, pane_id, cwd,
+                                    claude_pid=pane_pid or None, name=name,
+                                    spawned=False, log=log)
+    if new_tid is None:
+        return None
+    _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
+    _tmux("send-keys", "-t", pane_id, "Enter")
+    log("attach: bound pane {} ({}) to topic {}".format(pane_id, target[2], new_tid))
+    return new_tid
+
+
+def _stale_pane_ids(list_panes_output):
+    """Pure: given `list-panes -F "#{pane_id}\\t#{window_name}\\t#{@telegram_thread_id}"`
+    output, return the pane ids whose window is DEAD-renamed but still carry the
+    @telegram_thread_id binding. Split out from the tmux call so it's unit-testable
+    without a live server. The window name is bridge-controlled (`DEAD - <name>`),
+    the option value is a numeric thread id — neither contains a tab — so a 3-field
+    tab split is safe; an unset option yields an empty third field and is skipped."""
+    stale = []
+    for line in list_panes_output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        pane_id, wname, opt = parts
+        if wname.startswith("DEAD") and opt:
+            stale.append(pane_id)
+    return stale
+
+
+def clear_stale_pane_options():
+    """Backstop the pane-keyed resolver's invariant: a pane carries
+    @telegram_thread_id ONLY while its bridge session is live. The default reap
+    path (kill_old=false) RENAMES a retired window to "DEAD - ..." but leaves the
+    pane — and its stamped option — alive, and the in-session clear on /end /
+    compaction is best-effort (a skipped step, or a session that died mid-reap,
+    leaves the option set). A lingering option would mis-bind a fresh process later
+    started in that pane. Here the router unsets it programmatically on any pane in
+    a DEAD-renamed window. Idempotent, cheap (one list-panes per sweep), never
+    raises. (kill_old=true destroys the pane, so its option is already gone.)"""
+    out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+                "-F", "#{pane_id}\t#{window_name}\t#{@telegram_thread_id}")
+    for pane_id in _stale_pane_ids(out):
+        _tmux("set-option", "-pu", "-t", pane_id, "@telegram_thread_id")
+        log("backstop: cleared stale @telegram_thread_id on DEAD pane {}".format(pane_id))
 
 
 def _nudge_pane(reg, text, kind):
@@ -1028,6 +1224,10 @@ def context_loop():
         wedge_dwell = max(60, int(cfg.get("wedge_dwell_seconds", 300) or 300))
         # chat_id (for owner wedge alerts) read once per sweep — cheap small file.
         sweep_chat_id = load_state().get("chat_id")
+        # Backstop the pane-keyed binding once per sweep: unset @telegram_thread_id
+        # on any DEAD-renamed pane whose in-session clear was missed, so a reused
+        # pane can't mis-resolve to a retired topic. Pane-level, not per-topic.
+        clear_stale_pane_options()
         if REGISTRY_DIR.is_dir():
             for f in REGISTRY_DIR.glob("*.json"):
                 tkey = f.stem
@@ -1037,6 +1237,23 @@ def context_loop():
                     continue
                 if reg.get("thread_id") is None:
                     continue
+                # Backfill transcript_path: the programmatic bind (spawn/attach)
+                # writes the entry before the transcript file exists, so the gauge
+                # would stay dormant. Prefer the EXACT pane_id match (re-checked each
+                # sweep so a rollover — new pane, new transcript — re-points even if an
+                # earlier sweep made a cwd guess); fall back to cwd-newest only until a
+                # pane match exists. Persisted preserving pane_id/claude_pid/spawned.
+                _recs = _load_self_records()
+                _pane_tp = _select_transcript_by_pane(_recs, reg.get("pane_id"))
+                if _pane_tp:
+                    if _pane_tp != reg.get("transcript_path"):
+                        reg["transcript_path"] = _pane_tp
+                        _persist_registry(tkey, reg)
+                elif not reg.get("transcript_path"):
+                    _cwd_tp = _select_transcript_for_cwd(_recs, reg.get("cwd", ""))
+                    if _cwd_tp:
+                        reg["transcript_path"] = _cwd_tp
+                        _persist_registry(tkey, reg)
                 compute_status(reg, tkey)
                 # Clear a stale poll.lock.d / compacting.lock first, so a dead or
                 # abandoned drain/handoff can't wedge the topic and block the
@@ -1066,6 +1283,17 @@ def context_loop():
                 # pane and may transiently look like a prompt).
                 if not lock.exists():
                     handle_wedge(reg, tkey, sweep_chat_id, wedge_dwell)
+        # Topic reaper ("tidy forum"): TTL-delete forum topics closed longer than
+        # the TTL so ended/rolled-over sessions don't pile up closed topics. Opt-in
+        # (deleteForumTopic is irreversible) and throttled well below the TTL, so
+        # most sweeps are a cheap timestamp check that does nothing.
+        if cfg.get("topic_reaper_enabled"):
+            global _last_topic_reap
+            reap_every = max(300, int(cfg.get("topic_reap_interval_seconds", 3600) or 3600))
+            if (time.monotonic() - _last_topic_reap) >= reap_every:
+                ttl = max(3600, int(cfg.get("topic_ttl_seconds", 604800) or 604800))
+                reap_topics(sweep_chat_id, ttl)
+                _last_topic_reap = time.monotonic()
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:
@@ -1113,6 +1341,130 @@ def inject_inbox_note(reg, text, from_id, username):
         return False
 
 
+# --- topic lifecycle ledger + reaper ("tidy forum") ------------------------
+#
+# OQ1 confirmed forum_topic_created/closed/reopened arrive in getUpdates as
+# bot-authored `message` service updates (the close message's `date` IS the
+# closed_at a TTL needs). They're intercepted in handle_message AHEAD of the
+# owner-filter (which would drop them as not-from-owner) and folded into a small
+# ledger keyed by thread id. The opt-in reaper then deleteForumTopic's any topic
+# closed longer than the TTL, so ended/rolled-over sessions don't leave the forum
+# cluttered with closed topics. Topics created before the ledger shipped aren't
+# tracked (no event was ever recorded for them) — tidy those once by hand; the
+# reaper keeps it clean from here on.
+
+FORUM_TOPIC_KEYS = ("forum_topic_created", "forum_topic_closed",
+                    "forum_topic_reopened", "forum_topic_edited")
+
+
+def load_ledger():
+    """The topic ledger dict (thread_id str -> record), or {} if absent/corrupt."""
+    try:
+        data = json.loads(TOPICS_LEDGER.read_text())
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def save_ledger(ledger):
+    """Atomically persist the ledger. Best-effort; never raises into a caller."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = TOPICS_LEDGER.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ledger, indent=2))
+        tmp.replace(TOPICS_LEDGER)
+    except OSError as e:
+        log("WARN save_ledger: {}".format(e))
+
+
+def record_topic_event(msg, thread_id):
+    """Fold one forum_topic_* service message into the ledger. Timestamps come from
+    the message `date` (epoch) — for a close that IS closed_at, which the reaper
+    ages against. Best-effort: a bad/partial event never breaks the update pump."""
+    try:
+        tkey = str(thread_id)
+        when = int(msg.get("date") or 0) or int(time.time())
+        ledger = load_ledger()
+        rec = ledger.get(tkey) or {"thread_id": int(thread_id)}
+        if "forum_topic_created" in msg:
+            name = (msg.get("forum_topic_created") or {}).get("name")
+            if name:
+                rec["name"] = name
+            rec["created_at"] = rec.get("created_at") or when
+            rec["state"] = "open"
+            rec["closed_at"] = None
+        elif "forum_topic_closed" in msg:
+            rec["state"] = "closed"
+            rec["closed_at"] = when
+        elif "forum_topic_reopened" in msg:
+            rec["state"] = "open"
+            rec["closed_at"] = None
+        elif "forum_topic_edited" in msg:
+            name = (msg.get("forum_topic_edited") or {}).get("name")
+            if name:
+                rec["name"] = name
+        else:
+            return  # not a lifecycle event we track
+        ledger[tkey] = rec
+        save_ledger(ledger)
+        log("ledger: topic {} -> {}".format(tkey, rec.get("state")))
+    except (ValueError, TypeError) as e:
+        log("WARN record_topic_event: {}".format(e))
+
+
+def _topics_to_reap(ledger, now_epoch, ttl_seconds):
+    """Pure: thread-id keys whose topic has been CLOSED at least ttl_seconds ago.
+    Open topics, and closed ones still within the TTL, are kept; a closed entry
+    with no closed_at is skipped (it can't be aged). Split out so the reap policy
+    is unit-testable without the Telegram API."""
+    out = []
+    for tkey, rec in (ledger or {}).items():
+        if not isinstance(rec, dict) or rec.get("state") != "closed":
+            continue
+        closed_at = rec.get("closed_at")
+        if not closed_at:
+            continue
+        try:
+            if (now_epoch - int(closed_at)) >= ttl_seconds:
+                out.append(tkey)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def delete_forum_topic(chat_id, thread_id):
+    """deleteForumTopic — permanently remove a forum topic and its messages.
+    Best-effort; returns True only on an ok response so the reaper can keep a
+    failed entry for a later retry instead of dropping it from the ledger."""
+    try:
+        r = api_call("deleteForumTopic",
+                     {"chat_id": chat_id, "message_thread_id": thread_id})
+        return bool(r.get("ok"))
+    except (urllib.error.URLError, OSError) as e:
+        log("WARN deleteForumTopic {}: {}".format(thread_id, e))
+        return False
+
+
+def reap_topics(chat_id, ttl_seconds):
+    """Delete every topic closed longer than ttl_seconds and drop it from the
+    ledger. No-op without a chat_id. A topic whose delete fails stays in the ledger
+    (retried next sweep). Caller gates this on topic_reaper_enabled."""
+    if chat_id is None:
+        return
+    ledger = load_ledger()
+    doomed = _topics_to_reap(ledger, int(time.time()), ttl_seconds)
+    if not doomed:
+        return
+    changed = False
+    for tkey in doomed:
+        if delete_forum_topic(chat_id, int(tkey)):
+            ledger.pop(tkey, None)
+            changed = True
+            log("reaper: deleted long-closed topic {} (ttl {}s)".format(tkey, ttl_seconds))
+    if changed:
+        save_ledger(ledger)
+
+
 def handle_message(msg, state):
     chat = msg.get("chat", {})
     frm = msg.get("from", {})
@@ -1138,6 +1490,16 @@ def handle_message(msg, state):
         image_file_id = doc.get("file_id")
 
     if from_id is None or chat_id is None:
+        return
+
+    # --- topic lifecycle ledger ---
+    # forum_topic_* are bot-authored service messages (OQ1), so they MUST be folded
+    # into the ledger here, ahead of the owner-filter below that would drop them as
+    # not-from-owner. Scoped to the control chat (or pre-bootstrap, when chat_id is
+    # still unset). Recording is the whole job — these are never tasks or commands.
+    if thread_id is not None and any(k in msg for k in FORUM_TOPIC_KEYS):
+        if state.get("chat_id") in (None, chat_id):
+            record_topic_event(msg, thread_id)
         return
 
     # --- bootstrap: first message from the expected owner claims the bridge ---
@@ -1237,11 +1599,14 @@ def handle_message(msg, state):
         return
 
     if cmd == "attach":
-        # /attach [<n>|<window>] — adopt an EXISTING, unattached Claude session in the
-        # shared tmux session into its own topic. With no arg, list candidates. The
-        # mechanism: send-keys `/telegram-bridge` into the chosen pane so the session attaches
-        # ITSELF — it has no TELEGRAM_BRIDGE_SPAWNED, so it registers spawned:false
-        # (user-owned), and is therefore never reaped on /end (only detached).
+        # /attach [<n>|<window>|all] — adopt EXISTING, unattached Claude session(s)
+        # in the shared tmux session into their own topic(s). With no arg, list
+        # candidates; `all` binds every candidate. The router BINDS programmatically
+        # (off the LLM): create topic, stamp the pane option, write the registry
+        # (spawned:false → a user-owned window, only detached on /end, never reaped),
+        # THEN send /telegram-bridge so the session loads only the drain procedure —
+        # it detects the pane option is already set and skips create/register/stamp.
+        # All bind paths go through the shared _attach_one.
         parts = text.split(maxsplit=1)
         selector = parts[1].strip() if len(parts) > 1 else ""
         cands = list_unattached_claude_panes()
@@ -1250,10 +1615,29 @@ def handle_message(msg, state):
                          thread_id=thread_id, reply_to=message_id)
             return
         if not selector:
-            lines = ["Unattached Claude sessions — reply /attach <n> to bind one:"]
-            for i, (pid, widx, wname) in enumerate(cands, 1):
-                lines.append("{}. {} (window {})".format(i, wname, widx))
+            lines = ["Unattached Claude sessions — reply /attach <n> to bind one, "
+                     "or /attach all for every one:"]
+            for i, (pid, widx, label) in enumerate(cands, 1):
+                lines.append("{}. {} (window {})".format(i, label, widx))
             send_message(chat_id, "\n".join(lines), thread_id=thread_id, reply_to=message_id)
+            return
+        if selector.lower() == "all":
+            # Bulk-bind every candidate. Each is an independent topic create; a
+            # failure on one (createForumTopic) is reported but doesn't abort the
+            # rest. Report the roster so the owner knows which topics appeared.
+            bound, failed = [], []
+            for c in cands:
+                if _attach_one(chat_id, c) is not None:
+                    bound.append(c[2])
+                else:
+                    failed.append(c[2])
+            msg = ("Attached {} session(s): {}".format(len(bound), ", ".join(bound))
+                   if bound else "Couldn't attach any session.")
+            if failed:
+                msg += "\nFailed ({}): {}".format(len(failed), ", ".join(failed))
+            if bound:
+                msg += "\nEach opens its own topic and starts draining shortly."
+            send_message(chat_id, msg, thread_id=thread_id, reply_to=message_id)
             return
         target = None
         if selector.isdigit():
@@ -1262,19 +1646,20 @@ def handle_message(msg, state):
                 target = cands[k]
         if target is None:
             for c in cands:
-                if selector in (c[2], c[1]):   # window name or index
+                if selector in (c[2], c[1]):   # label or window index
                     target = c
                     break
         if target is None:
             send_message(chat_id, "No match for {!r}. Send /attach with no argument to list."
                          .format(selector), thread_id=thread_id, reply_to=message_id)
             return
-        pane_id = target[0]
-        _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
-        _tmux("send-keys", "-t", pane_id, "Enter")
-        send_message(chat_id, "Sent /telegram-bridge to {} — it'll open its own topic shortly."
+        new_tid = _attach_one(chat_id, target)
+        if new_tid is None:
+            send_message(chat_id, "Couldn't create a topic for {} — not attaching."
+                         .format(target[2]), thread_id=thread_id, reply_to=message_id)
+            return
+        send_message(chat_id, "Attached {} to its topic — it'll start draining shortly."
                      .format(target[2]), thread_id=thread_id, reply_to=message_id)
-        log("attach: sent /telegram-bridge to pane {} ({})".format(pane_id, target[2]))
         return
 
     # --- route to the session that owns this topic ---
@@ -1693,6 +2078,12 @@ def main():
             continue
 
         updates = resp.get("result", [])
+        # OQ1 diagnostic: dump raw update JSON when debug_raw_updates is set. Read
+        # live (only when a batch arrives, so empty long-polls cost nothing) so the
+        # flag can be flipped in compaction.json without restarting the router.
+        if updates and load_compaction_cfg().get("debug_raw_updates"):
+            for _u in updates:
+                log("RAW UPDATE: " + json.dumps(_u))
         for upd in updates:
             state["offset"] = upd["update_id"] + 1
             msg = upd.get("message")
