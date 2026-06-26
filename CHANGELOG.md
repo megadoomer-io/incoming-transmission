@@ -13,6 +13,19 @@
   (race-free), with a cwd fallback retained for sessions bound before the
   migration. (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`;
   resolver added earlier in `runtime/bridge_resolve.py`.)
+- **Binding moved off the LLM — programmatic topic creation, registration, and
+  pane stamping.** Creating the forum topic, writing `registry/<thread>.json`, and
+  stamping `@telegram_thread_id` used to run in the skill (the model). Now the
+  spawn script does it for `/new` and compaction rollover (it creates/reuses the
+  topic, injects the race-free `TELEGRAM_BRIDGE_THREAD_ID`, captures the new pane id,
+  stamps the option, and writes the registry — carrying `spawned` forward on
+  rollover), and the router does it for `/attach` (create topic, stamp, register,
+  then send `/telegram-bridge`). The skill now DETECTS it's already bound and loads
+  only the drain procedure; its self-bind remains as a guarded legacy fallback
+  (removed in the clean cutover). Registry entries gain `pane_id`; the router
+  lazily backfills `transcript_path` (unknown at spawn time) from the SessionStart
+  self-record so the context gauge still starts.
+  (`runtime/telegram-spawn.sh`, `runtime/telegram-router.py`, `skill/telegram-bridge/SKILL.md`.)
 
 ### Fixed
 - **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
