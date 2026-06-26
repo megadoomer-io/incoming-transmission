@@ -180,6 +180,95 @@ def load_registry(tkey):
     return None
 
 
+def write_registry_entry(thread_id, *, pane_id=None, claude_pid=None, cwd="",
+                         inbox_path=None, spawned=False, transcript_path=""):
+    """Write registry/<thread>.json atomically. The router-side counterpart to the
+    spawn script's registry write (same schema) — used by programmatic /attach
+    binding. transcript_path is left empty by default; the context-loop backfill
+    fills it from the SessionStart self-record. Returns the entry, or None on error."""
+    tid = int(thread_id)
+    if inbox_path is None:
+        inbox_path = "/tmp/claude-telegram/sessions/{}/inbox.jsonl".format(tid)
+    entry = {
+        "thread_id": tid,
+        "pane_id": pane_id or None,
+        "claude_pid": int(claude_pid) if claude_pid else None,
+        "inbox_path": inbox_path,
+        "cwd": cwd,
+        "transcript_path": transcript_path,
+        "spawned": bool(spawned),
+        "context": "session attached",
+        "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        path = REGISTRY_DIR / "{}.json".format(tid)
+        tmp = REGISTRY_DIR / "{}.json.tmp".format(tid)
+        tmp.write_text(json.dumps(entry, indent=2))
+        os.replace(str(tmp), str(path))
+    except OSError as e:
+        log("ERROR write_registry_entry {}: {}".format(tid, e))
+        return None
+    return entry
+
+
+def _persist_registry(tkey, reg):
+    """Atomically write a (possibly mutated) registry entry dict back. Used by the
+    context-loop backfill, which updates an already-loaded entry in place (so it
+    preserves pane_id/claude_pid/spawned, unlike write_registry_entry which rebuilds)."""
+    try:
+        path = REGISTRY_DIR / "{}.json".format(tkey)
+        tmp = REGISTRY_DIR / "{}.json.tmp".format(tkey)
+        tmp.write_text(json.dumps(reg, indent=2))
+        os.replace(str(tmp), str(path))
+        return True
+    except OSError as e:
+        log("ERROR persist registry {}: {}".format(tkey, e))
+        return False
+
+
+def _load_self_records():
+    """All SessionStart self-records (self/*.json), written by the
+    telegram-self-register hook. Each carries {transcript_path, cwd, ...}."""
+    recs = []
+    sd = STATE_DIR / "self"
+    if not sd.is_dir():
+        return recs
+    for f in sd.glob("*.json"):
+        try:
+            recs.append(json.loads(f.read_text()))
+        except (ValueError, OSError):
+            continue
+    return recs
+
+
+def _select_transcript_for_cwd(records, cwd, mtime_of=None):
+    """Pick the newest-mtime transcript_path among self-records matching cwd, or "".
+
+    Matched by cwd (the self-record's pid is the launcher, not the claude process,
+    so it can't disambiguate). cwd is not unique per session, but transcript_path
+    only drives the context gauge — not routing/gating, which use the exact pane
+    option — so the same-cwd heuristic is acceptable (and matches the pre-pane
+    skill's behavior). mtime_of is injectable for tests; a path that errors is
+    skipped (a vanished transcript shouldn't win)."""
+    if mtime_of is None:
+        mtime_of = os.path.getmtime
+    target = os.path.realpath(cwd) if cwd else ""
+    best_m, best = -1.0, ""
+    for rec in records:
+        rc = rec.get("cwd")
+        tp = rec.get("transcript_path")
+        if not rc or not tp or os.path.realpath(rc) != target:
+            continue
+        try:
+            m = mtime_of(tp)
+        except OSError:
+            continue
+        if m > best_m:
+            best_m, best = m, tp
+    return best
+
+
 # --- message_id -> topic index (for routing reactions) ---------------------
 
 def record_msg_thread(message_id, tkey):
@@ -280,6 +369,28 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
         tk = "general" if thread_id in (None, "general") else str(thread_id)
         record_msg_thread(mid, tk)
     return last
+
+
+def create_forum_topic(chat_id, name, retries=3):
+    """Create a Telegram forum topic; return its message_thread_id (int) or None.
+
+    Retries a few times because a silent failure would leave a session with no
+    topic — callers MUST NOT bind on None. The router-owned, programmatic version
+    of the createForumTopic call the skill used to make."""
+    params = {"chat_id": chat_id, "name": name}
+    for attempt in range(retries):
+        try:
+            r = api_call("createForumTopic", params)
+        except (urllib.error.URLError, OSError) as e:
+            log("WARN createForumTopic attempt {}: {}".format(attempt + 1, e))
+            time.sleep(1.5)
+            continue
+        if r.get("ok"):
+            return r["result"]["message_thread_id"]
+        log("WARN createForumTopic not ok: {}".format(r))
+        time.sleep(1.5)
+    log("ERROR createForumTopic failed for {!r} after {} attempts".format(name, retries))
+    return None
 
 
 def react_eyes(chat_id, message_id):
@@ -1076,6 +1187,16 @@ def context_loop():
                     continue
                 if reg.get("thread_id") is None:
                     continue
+                # Backfill transcript_path: programmatic bind (spawn/attach) writes
+                # the entry before the transcript file exists, so the context gauge
+                # would stay dormant. Fill it from the newest-mtime self-record for
+                # this cwd, then persist (preserving pane_id/claude_pid/spawned).
+                # Guarded by "not set", so it costs one self-dir scan only until filled.
+                if not reg.get("transcript_path"):
+                    _tp = _select_transcript_for_cwd(_load_self_records(), reg.get("cwd", ""))
+                    if _tp:
+                        reg["transcript_path"] = _tp
+                        _persist_registry(tkey, reg)
                 compute_status(reg, tkey)
                 # Clear a stale poll.lock.d / compacting.lock first, so a dead or
                 # abandoned drain/handoff can't wedge the topic and block the
@@ -1276,11 +1397,13 @@ def handle_message(msg, state):
         return
 
     if cmd == "attach":
-        # /attach [<n>|<window>] — adopt an EXISTING, unattached Claude session in the
-        # shared tmux session into its own topic. With no arg, list candidates. The
-        # mechanism: send-keys `/telegram-bridge` into the chosen pane so the session attaches
-        # ITSELF — it has no TELEGRAM_BRIDGE_SPAWNED, so it registers spawned:false
-        # (user-owned), and is therefore never reaped on /end (only detached).
+        # /attach [<n>|<window>] — adopt an EXISTING, unattached Claude session in
+        # the shared tmux session into its own topic. With no arg, list candidates.
+        # The router BINDS programmatically (off the LLM): it creates the topic,
+        # stamps the pane option, and writes the registry (spawned:false → a
+        # user-owned window, only detached on /end, never reaped), THEN sends
+        # /telegram-bridge so the session loads only the drain procedure — it detects
+        # the pane option is already set and skips create/register/stamp.
         parts = text.split(maxsplit=1)
         selector = parts[1].strip() if len(parts) > 1 else ""
         cands = list_unattached_claude_panes()
@@ -1309,11 +1432,31 @@ def handle_message(msg, state):
                          .format(selector), thread_id=thread_id, reply_to=message_id)
             return
         pane_id = target[0]
+        # Resolve the pane's cwd + pid for the registry. claude is the pane command
+        # (or a descendant), so storing the pane pid lets _pane_for_claude_pid match.
+        cwd = _tmux("display-message", "-p", "-t", pane_id, "#{pane_current_path}").strip()
+        pane_pid = _tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").strip()
+        try:
+            branch = subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                                    capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            branch = ""
+        name = "{}@{}".format(os.path.basename(cwd) or "session", branch or "nogit")
+        new_tid = create_forum_topic(chat_id, name)
+        if new_tid is None:
+            send_message(chat_id, "Couldn't create a topic for {} — not attaching."
+                         .format(target[2]), thread_id=thread_id, reply_to=message_id)
+            return
+        # Bind programmatically BEFORE the send-keys: stamp the pane option (the skill
+        # detects it and skips its own create/register/stamp) and write the registry.
+        _tmux("set-option", "-p", "-t", pane_id, "@telegram_thread_id", str(new_tid))
+        write_registry_entry(new_tid, pane_id=pane_id, claude_pid=pane_pid or None,
+                             cwd=cwd, spawned=False)
         _tmux("send-keys", "-t", pane_id, "-l", "/telegram-bridge")
         _tmux("send-keys", "-t", pane_id, "Enter")
-        send_message(chat_id, "Sent /telegram-bridge to {} — it'll open its own topic shortly."
+        send_message(chat_id, "Attached {} to its topic — it'll start draining shortly."
                      .format(target[2]), thread_id=thread_id, reply_to=message_id)
-        log("attach: sent /telegram-bridge to pane {} ({})".format(pane_id, target[2]))
+        log("attach: bound pane {} ({}) to topic {}".format(pane_id, target[2], new_tid))
         return
 
     # --- route to the session that owns this topic ---
