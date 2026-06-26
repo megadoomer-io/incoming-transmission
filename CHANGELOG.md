@@ -39,6 +39,18 @@
   future topic ledger must intercept `forum_topic_*` ahead of that drop.
   (`runtime/telegram-router.py`.)
 
+### Removed
+- **Clean cutover: the resolver's cwd fallback is gone.** With binding now
+  programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
+  `bridge_resolve.resolve()` is pane-keyed only — pane option then spawn env, no
+  cwd. Deleted `resolve_topic_cwd_fallback` and its `_pid_alive` /
+  `_claude_ancestor_pid` helpers, the `cwd_fallback`/`cwd`/`registry_dir` params,
+  and the now-dead cwd-keyed `find_topic` (+ helpers) still sitting in the
+  permission hook. The three callers call `resolve()` with no cwd. A pane with no
+  `@telegram_thread_id` is, by definition, not a bridge session.
+  (`runtime/bridge_resolve.py`, `runtime/telegram-permission-hook.py`,
+  `runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
+
 ### Fixed
 - **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
   earlier dead-pid backstop only patched the permission hook; routing the AUQ

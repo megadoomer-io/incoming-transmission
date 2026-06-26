@@ -26,7 +26,7 @@
 # This generalizes telegram-permission-hook.py's Approve/Deny round-trip. Same
 # machinery:
 #   - bridge_resolve.resolve : find this session's topic (pane option -> spawn
-#     env -> cwd-fallback), then registry/<thread>.json for the inbox path
+#     env), then registry/<thread>.json for the inbox path
 #   - state.json             : chat_id
 #   - inbox.jsonl            : the owner's tap/reply lands here (routed by daemon)
 #   - read.offset            : advanced past consumed replies so the session poll
@@ -47,7 +47,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
+import bridge_resolve  # shared pane-keyed resolver (pane option -> spawn env)
 
 WAIT_TIMEOUT_S = 600          # per-question wait for a phone tap; never auto-picks
 POLL_INTERVAL_S = 2
@@ -124,16 +124,15 @@ def send(token, chat_id, thread_id, text, reply_markup=None):
         pass  # best-effort; a failed send must not crash the hook
 
 
-def find_topic(cwd):
+def find_topic():
     """Return (thread_id, inbox_path) for THIS session's topic, or None.
 
-    Delegates to the shared pane-keyed resolver (pane option -> spawn env ->
-    cwd-fallback during migration), then loads the registry entry by thread_id
-    for its inbox path. Keying on the tmux pane instead of cwd disambiguates
-    multiple bridge sessions in one repo — the collision the old cwd-only copy
-    here could not. None means "not a bridge session" and the caller abstains.
+    Resolves via the shared pane-keyed resolver (the `@telegram_thread_id` pane
+    option, or the spawn env in the spawn-race window), then loads the registry
+    entry by thread_id for its inbox path. None means "not a bridge session" and
+    the caller abstains.
     """
-    thread_id = bridge_resolve.resolve(cwd=cwd)
+    thread_id = bridge_resolve.resolve()
     if thread_id is None:
         return None
     try:
@@ -212,10 +211,10 @@ def main():
     if not questions:
         abstain("no questions")
 
-    cwd = str(payload.get("cwd", os.getcwd()))
-    topic = find_topic(cwd)
+    cwd = str(payload.get("cwd", os.getcwd()))   # kept for the debug trail below
+    topic = find_topic()
     if topic is None:
-        abstain("no topic for cwd=" + cwd)   # let normal flow handle it
+        abstain("not a bridge session (cwd=%s)" % cwd)   # let normal flow handle it
     thread_id, inbox_path = topic
     _dbg("topic={} inbox={} cwd={}".format(thread_id, inbox_path, cwd))
 

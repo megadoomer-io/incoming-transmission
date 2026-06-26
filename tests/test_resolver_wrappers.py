@@ -90,14 +90,14 @@ def test_auq_hook_find_topic_delegates(monkeypatch, registry):
     mod = _load("auq_hook_ut1", "telegram-askuserquestion-hook.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: "2103")
     # Hook hands the caller the raw inbox_path (it derives read.offset itself).
-    assert mod.find_topic("/anywhere") == ("2103", "/x/sessions/2103/inbox.jsonl")
+    assert mod.find_topic() == ("2103", "/x/sessions/2103/inbox.jsonl")
 
 
 def test_auq_hook_find_topic_none_when_not_bridge(monkeypatch, registry):
     state_dir, _ = registry
     mod = _load("auq_hook_ut2", "telegram-askuserquestion-hook.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: None)
-    assert mod.find_topic("/anywhere") is None
+    assert mod.find_topic() is None
 
 
 def test_auq_hook_find_topic_none_when_registry_missing(monkeypatch, registry):
@@ -106,7 +106,7 @@ def test_auq_hook_find_topic_none_when_registry_missing(monkeypatch, registry):
     state_dir, _ = registry
     mod = _load("auq_hook_ut3", "telegram-askuserquestion-hook.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: "9999")
-    assert mod.find_topic("/anywhere") is None
+    assert mod.find_topic() is None
 
 
 # --- AUQ MCP: _find_topic -> (thread_id, session_dir) -----------------------
@@ -118,7 +118,7 @@ def test_auq_mcp_find_topic_returns_session_dir(monkeypatch, registry):
     mod = _load("auq_mcp_ut1", "telegram-auq-mcp.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: "2164")
     # MCP wants the session DIR (where auq-pending/auq-answer live), i.e. parent.
-    assert mod._find_topic("/anywhere") == ("2164", "/x/sessions/2164")
+    assert mod._find_topic() == ("2164", "/x/sessions/2164")
 
 
 def test_auq_mcp_find_topic_none_when_not_bridge(monkeypatch, registry):
@@ -126,7 +126,7 @@ def test_auq_mcp_find_topic_none_when_not_bridge(monkeypatch, registry):
     state_dir, _ = registry
     mod = _load("auq_mcp_ut2", "telegram-auq-mcp.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: None)
-    assert mod._find_topic("/anywhere") is None
+    assert mod._find_topic() is None
 
 
 def test_auq_mcp_find_topic_none_when_inbox_missing(monkeypatch, registry):
@@ -136,4 +136,4 @@ def test_auq_mcp_find_topic_none_when_inbox_missing(monkeypatch, registry):
     write("2168")  # no inbox_path field
     mod = _load("auq_mcp_ut3", "telegram-auq-mcp.py", state_dir, monkeypatch)
     monkeypatch.setattr(mod.bridge_resolve, "resolve", lambda **kw: "2168")
-    assert mod._find_topic("/anywhere") is None
+    assert mod._find_topic() is None

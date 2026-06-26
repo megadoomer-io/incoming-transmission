@@ -23,7 +23,7 @@
 #
 # Round-trip:
 #   - bridge_resolve.resolve : find this session's topic (pane option -> spawn
-#     env -> cwd-fallback), then registry/<thread>.json for the session dir
+#     env), then registry/<thread>.json for the session dir
 #   - state.json             : chat_id
 #   - sendMessage(reply_markup=inline_keyboard) : post the options as buttons
 #   - the router converts a tap (callback_data "auq:<thread>:<qidx>:<oidx>") into
@@ -46,7 +46,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
+import bridge_resolve  # shared pane-keyed resolver (pane option -> spawn env)
 
 WAIT_TIMEOUT_S = 1700
 POLL_INTERVAL_S = 2
@@ -60,18 +60,16 @@ STATE_FILE = STATE_DIR / "state.json"
 mcp = FastMCP("telegram")
 
 
-def _find_topic(cwd: str):
+def _find_topic():
     """Return (thread_id, session_dir) for THIS session's topic, or None.
 
-    Delegates to the shared pane-keyed resolver (pane option -> spawn env ->
-    cwd-fallback during migration), which keys on the tmux pane instead of cwd
-    and so disambiguates multiple bridge sessions in one repo — the collision
-    the old cwd-only copy here could not. Then loads the registry entry by
-    thread_id for the session dir, where the auq-pending / auq-answer
+    Resolves via the shared pane-keyed resolver (the `@telegram_thread_id` pane
+    option, or the spawn env in the spawn-race window), then loads the registry
+    entry by thread_id for the session dir, where the auq-pending / auq-answer
     side-channel files live. A None result means "not a bridge session" and the
     caller surfaces that without hanging.
     """
-    thread_id = bridge_resolve.resolve(cwd=cwd)
+    thread_id = bridge_resolve.resolve()
     if thread_id is None:
         return None
     try:
@@ -239,8 +237,7 @@ def AskUserQuestion(questions: list[dict[str, Any]]) -> dict[str, Any]:
     proceed without fabricating a choice.
     """
     token = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN")
-    cwd = os.getcwd()
-    topic = _find_topic(cwd)
+    topic = _find_topic()
     chat_id = _chat_id()
     if not token or topic is None or chat_id is None:
         # Can't reach Telegram for this session — surface, don't hang.

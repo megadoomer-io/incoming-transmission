@@ -78,13 +78,12 @@ import fnmatch
 import json
 import os
 import shlex
-import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
 
-import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
+import bridge_resolve  # shared pane-keyed resolver (pane option -> spawn env)
 
 GATED_FILE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 # How long to wait for the owner to answer before self-resolving (deny). Generous
@@ -183,95 +182,6 @@ def send(token, chat_id, thread_id, text, reply_markup=None):
         urllib.request.urlopen(req, timeout=20).read()
     except Exception:
         pass  # best-effort; a failed send must not crash the hook
-
-
-def _claude_ancestor_pid():
-    """PID of the `claude` process that owns this hook, by walking up the tree.
-    Disambiguates multiple bridge sessions sharing one cwd. macOS `ps -o comm=`
-    truncates to 16 chars (hides 'claude' in a long path), so use `ps -c`."""
-    pid = os.getppid()
-    for _ in range(12):
-        if pid <= 1:
-            return None
-        try:
-            out = subprocess.run(["ps", "-c", "-o", "comm=,ppid=", "-p", str(pid)],
-                                 capture_output=True, text=True, timeout=5).stdout.strip()
-        except Exception:
-            return None
-        if not out:
-            return None
-        toks = out.rsplit(None, 1)
-        comm = toks[0] if toks else ""
-        if "claude" in comm.lower():
-            return pid
-        try:
-            pid = int(toks[1]) if len(toks) > 1 else -1
-        except ValueError:
-            return None
-    return None
-
-
-def _pid_alive(pid):
-    """True if the process is alive. os.kill(pid, 0) raises ProcessLookupError if
-    the pid is gone. A dead claude_pid means an ORPHANED registry entry -- a
-    session that died without deregistering (e.g. across a reboot). It must NOT
-    gate a fresh session that merely shares the same cwd, which would route the
-    fresh session's approvals to a Telegram topic no one is watching."""
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (ProcessLookupError, ValueError, TypeError):
-        return False
-    except PermissionError:
-        return True  # exists, owned by another user (same-user here; defensive)
-
-
-def find_topic(cwd):
-    """Return (thread_id, session_dir) for THIS session's topic, or None if this
-    is not a bridge session.
-
-    This is also the GATE: a None result means "not a bridge session, leave it
-    alone". So the no-match path must be cheap -- it runs on every tool call in
-    every (mostly non-bridge) session. We match registry entries by cwd FIRST with
-    no subprocess; only when several bridge sessions share one cwd do we walk the
-    process tree (_claude_ancestor_pid) to pick the one owned by our claude.
-    """
-    if not REGISTRY_DIR.is_dir():
-        return None
-    cwd = os.path.realpath(cwd)
-    matches = []   # (registered_at, claude_pid, thread_id, session_dir)
-    for f in REGISTRY_DIR.glob("*.json"):
-        try:
-            reg = json.loads(f.read_text())
-        except Exception:
-            continue
-        rc = reg.get("cwd")
-        if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
-            continue
-        # Skip orphaned entries: a dead claude_pid means the bridged session is
-        # gone (e.g. killed by a reboot without deregistering). Matching it here
-        # would gate a FRESH, unbridged session that merely shares this cwd and
-        # hang it on a Telegram topic no one is watching. Entries with no
-        # claude_pid are kept (older format; can't assess liveness).
-        cp = reg.get("claude_pid")
-        if cp is not None and not _pid_alive(cp):
-            continue
-        inbox = reg.get("inbox_path") or ""
-        session_dir = str(Path(inbox).parent) if inbox else ""
-        matches.append((str(reg.get("registered_at", "")), reg.get("claude_pid"),
-                        str(reg["thread_id"]), session_dir))
-    if not matches:
-        return None                        # not a bridge session (cheap, no ps)
-    if len(matches) == 1:
-        return matches[0][2], matches[0][3]
-    # Several sessions share this cwd: disambiguate by our owning claude pid.
-    cpid = _claude_ancestor_pid()
-    if cpid is not None:
-        for m in matches:
-            if m[1] == cpid:
-                return m[2], m[3]
-    matches.sort(reverse=True)             # newest registered_at wins (fallback)
-    return matches[0][2], matches[0][3]
 
 
 def mcp_allow_patterns():
@@ -474,17 +384,15 @@ def main():
     tool_name = str(payload.get("tool_name", ""))
     tool_input = payload.get("tool_input", {}) or {}
     is_mcp = tool_name.startswith("mcp__")
-    cwd = str(payload.get("cwd", os.getcwd()))
 
     # THE GATE: this permission model applies to EVERY bridge session -- one
     # attached to a Telegram topic -- and to nothing else, regardless of HOW the
-    # session started (/new spawn OR /telegram attach). The experience must not
-    # depend on the launch path. We resolve this session's topic via the shared
-    # resolver: the pane option (+ env spawn-binding) first, then a cwd-keyed
-    # fallback for sessions bound before the pane-keying migration. A non-bridge
-    # session resolves to None and we abstain instantly, leaving its normal
+    # session started (/new spawn OR /attach adopt). The experience must not depend
+    # on the launch path. We resolve this session's topic via the shared resolver:
+    # the pane option (authoritative) or the spawn env. A non-bridge session (no
+    # pane option) resolves to None and we abstain instantly, leaving its normal
     # permission flow untouched.
-    thread_id = bridge_resolve.resolve(cwd=cwd)
+    thread_id = bridge_resolve.resolve()
     if thread_id is None:
         abstain()
     # Load this thread's registry entry for the inbox / session dir (where the
