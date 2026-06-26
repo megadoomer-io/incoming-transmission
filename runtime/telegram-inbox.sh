@@ -23,9 +23,11 @@
 #   telegram-inbox.sh drain <thread>
 #       Acquire the per-topic lock (reclaiming a stale one past poll_lock_ttl_seconds),
 #       print the new inbox lines (JSON, one per line) after read.offset, and record
-#       the would-be new offset in SESS/.drain-pending. The lock stays HELD and
-#       read.offset is NOT advanced yet. Prints nothing if there's no backlog.
-#       Exit 3 (LOCKED on stderr) if a live drain already holds the lock.
+#       the would-be new offset in SESS/.drain-pending. With backlog the lock stays
+#       HELD (read.offset is NOT advanced yet) until `ack`. With NO backlog it prints
+#       nothing, releases the lock immediately, and needs no ack — so an empty drain
+#       (e.g. the bind-time section-A drain before any message arrives) can't leak the
+#       lock. Exit 3 (LOCKED on stderr) if a live drain already holds the lock.
 #
 #   telegram-inbox.sh ack <thread>
 #       Commit SESS/.drain-pending -> read.offset and release the lock. Run this
@@ -72,12 +74,23 @@ case "$CMD" in
             fi
         fi
         off="$(cat "$OFFSET" 2>/dev/null || echo 0)"
-        total="$(wc -l < "$INBOX" 2>/dev/null | tr -d ' ' || echo 0)"
+        total="$(wc -l 2>/dev/null < "$INBOX" | tr -d ' ' || echo 0)"
         off="${off:-0}"; total="${total:-0}"
-        echo "$total" > "$PENDING"
-        if [ "$total" -gt "$off" ]; then
-            tail -n "+$((off + 1))" "$INBOX"
+        if [ "$total" -le "$off" ]; then
+            # Nothing new to hand off: release the lock we just took and require
+            # NO ack. drain/ack is a lock handshake (drain acquires, ack releases),
+            # so an empty drain that kept the lock leaks it when the session
+            # reasonably concludes "nothing to drain, no ack needed" — exactly what
+            # the bind-time section-A drain does before any message has arrived. The
+            # first real message then can't acquire the lock until the 30m stale-TTL
+            # (or a self-heal) clears it. Self-releasing here makes the empty path
+            # safe regardless of whether the session acks.
+            rm -f "$PENDING" 2>/dev/null || true
+            rmdir "$LOCK" 2>/dev/null || true
+            exit 0
         fi
+        echo "$total" > "$PENDING"
+        tail -n "+$((off + 1))" "$INBOX"
         ;;
     ack)
         pend="$(cat "$PENDING" 2>/dev/null || echo "")"

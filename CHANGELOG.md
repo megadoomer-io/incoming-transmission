@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — drain lock-leak fix
+
+### Fixed
+- **An empty `telegram-inbox.sh drain` no longer leaks `poll.lock.d`.** `drain`/`ack`
+  is a lock handshake: `drain` acquires the per-topic lock, `ack` releases it. The
+  bind-time section-A drain runs before any message has arrived, so it found an empty
+  inbox, kept the lock, and the session reasonably skipped the ack ("nothing to
+  drain"). The first real message then couldn't acquire the leaked lock and stalled
+  until the 30-minute stale-TTL (or a session self-heal) cleared it — a multi-minute
+  delay on the first reply of every freshly bound session. An empty drain now
+  releases the lock immediately and needs no ack, so the empty path can't leak
+  regardless of whether the session acks. Also silenced the `wc: No such file or
+  directory` stderr on that path (the `<` redirect error escaped `2>/dev/null` —
+  reordered so an empty drain is truly silent). Surfaced by the keyboard `/telegram`
+  round-trip test. (`runtime/telegram-inbox.sh`; regression coverage in
+  `tests/test_inbox_drain.py`.)
+
 ## Unreleased — pane-keyed session↔topic resolution (Phase 1)
 
 ### Changed
