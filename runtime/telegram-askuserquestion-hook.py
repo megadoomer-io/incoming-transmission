@@ -25,7 +25,8 @@
 #
 # This generalizes telegram-permission-hook.py's Approve/Deny round-trip. Same
 # machinery:
-#   - registry/<thread>.json : find this session's topic by matching cwd
+#   - bridge_resolve.resolve : find this session's topic (pane option -> spawn
+#     env -> cwd-fallback), then registry/<thread>.json for the inbox path
 #   - state.json             : chat_id
 #   - inbox.jsonl            : the owner's tap/reply lands here (routed by daemon)
 #   - read.offset            : advanced past consumed replies so the session poll
@@ -45,6 +46,8 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
 
 WAIT_TIMEOUT_S = 600          # per-question wait for a phone tap; never auto-picks
 POLL_INTERVAL_S = 2
@@ -122,21 +125,22 @@ def send(token, chat_id, thread_id, text, reply_markup=None):
 
 
 def find_topic(cwd):
-    """Return (thread_id, inbox_path) for the registry entry matching cwd."""
-    if not REGISTRY_DIR.is_dir():
+    """Return (thread_id, inbox_path) for THIS session's topic, or None.
+
+    Delegates to the shared pane-keyed resolver (pane option -> spawn env ->
+    cwd-fallback during migration), then loads the registry entry by thread_id
+    for its inbox path. Keying on the tmux pane instead of cwd disambiguates
+    multiple bridge sessions in one repo — the collision the old cwd-only copy
+    here could not. None means "not a bridge session" and the caller abstains.
+    """
+    thread_id = bridge_resolve.resolve(cwd=cwd)
+    if thread_id is None:
         return None
-    # realpath both sides: registry stores the spawn-seen cwd (e.g. /tmp) but the
-    # caller may pass the symlink-resolved path (e.g. /private/tmp on macOS).
-    cwd = os.path.realpath(cwd)
-    for f in REGISTRY_DIR.glob("*.json"):
-        try:
-            reg = json.loads(f.read_text())
-        except Exception:
-            continue
-        rc = reg.get("cwd")
-        if rc and os.path.realpath(rc) == cwd and reg.get("thread_id") is not None:
-            return str(reg["thread_id"]), reg.get("inbox_path")
-    return None
+    try:
+        reg = json.loads((REGISTRY_DIR / "{}.json".format(thread_id)).read_text())
+    except (OSError, ValueError):
+        return None
+    return thread_id, reg.get("inbox_path")
 
 
 def _clip(text, limit=300):

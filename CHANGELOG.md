@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — pane-keyed session↔topic resolution (Phase 1)
+
+### Changed
+- **All three resolvers now share `bridge_resolve`, keyed on the tmux pane.** The
+  permission hook, the AskUserQuestion MCP server, and the AskUserQuestion hook
+  each carried their own near-identical copy that resolved a session's topic by
+  cwd. cwd is not unique per session — two Claudes in one repo share it — so a
+  shared cwd could route one session's prompts to the other's topic. They now
+  call `bridge_resolve.resolve()`, which keys on the `@telegram_thread_id` pane
+  option (authoritative) and the `TELEGRAM_BRIDGE_THREAD_ID` spawn env
+  (race-free), with a cwd fallback retained for sessions bound before the
+  migration. (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`;
+  resolver added earlier in `runtime/bridge_resolve.py`.)
+
+### Fixed
+- **The AUQ MCP and AUQ hook no longer mis-route to an orphaned topic.** The
+  earlier dead-pid backstop only patched the permission hook; routing the AUQ
+  resolvers through the shared resolver closes the same latent mis-route in both
+  (a fresh session sharing a dead session's cwd is no longer gated against the
+  stale topic). (`runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
+
 ## Unreleased — router-integrated wedge auto-clear
 
 ### Changed

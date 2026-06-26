@@ -22,7 +22,8 @@
 # instead — and the question shows up on the phone with buttons.
 #
 # Round-trip:
-#   - registry/<thread>.json : find this session's topic by matching cwd
+#   - bridge_resolve.resolve : find this session's topic (pane option -> spawn
+#     env -> cwd-fallback), then registry/<thread>.json for the session dir
 #   - state.json             : chat_id
 #   - sendMessage(reply_markup=inline_keyboard) : post the options as buttons
 #   - the router converts a tap (callback_data "auq:<thread>:<qidx>:<oidx>") into
@@ -31,19 +32,21 @@
 # No-auto-pick: on timeout we return a structured "no answer" result (never a
 # fabricated choice) so the model can re-ask or stop.
 #
-# cwd is inherited from the spawned `claude` (= the session's cwd), which is how
-# we resolve the topic. Token comes from TELEGRAM_BRIDGE_BOT_TOKEN (spawn-injected).
+# The session is resolved by the shared pane-keyed resolver (TMUX_PANE /
+# TELEGRAM_BRIDGE_THREAD_ID are inherited from the spawned `claude`; cwd is the
+# migration fallback). Token comes from TELEGRAM_BRIDGE_BOT_TOKEN (spawn-injected).
 
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+
+import bridge_resolve  # shared pane-keyed resolver (pane -> env -> cwd fallback)
 
 WAIT_TIMEOUT_S = 1700
 POLL_INTERVAL_S = 2
@@ -57,68 +60,28 @@ STATE_FILE = STATE_DIR / "state.json"
 mcp = FastMCP("telegram")
 
 
-def _claude_ancestor_pid():
-    """PID of the `claude` process that owns this MCP server, by walking up the
-    process tree. Lets us disambiguate multiple bridge sessions sharing one cwd.
-    Returns None if it can't be determined (macOS/Linux `ps`)."""
-    pid = os.getppid()
-    for _ in range(12):
-        if pid <= 1:
-            return None
-        try:
-            out = subprocess.run(
-                ["ps", "-c", "-o", "comm=,ppid=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=5).stdout.strip()
-        except Exception:
-            return None
-        if not out:
-            return None
-        toks = out.rsplit(None, 1)          # comm may contain spaces/paths
-        comm = toks[0] if toks else ""
-        if "claude" in comm.lower():
-            return pid
-        try:
-            pid = int(toks[1]) if len(toks) > 1 else -1
-        except ValueError:
-            return None
-    return None
-
-
 def _find_topic(cwd: str):
-    """Return (thread_id, session_dir) for THIS session's topic.
+    """Return (thread_id, session_dir) for THIS session's topic, or None.
 
-    Multiple bridge sessions can share a cwd, so cwd alone is ambiguous. Prefer
-    the registry entry whose `claude_pid` matches our owning claude process;
-    fall back to the most-recently-registered cwd match for legacy entries that
-    predate claude_pid recording.
+    Delegates to the shared pane-keyed resolver (pane option -> spawn env ->
+    cwd-fallback during migration), which keys on the tmux pane instead of cwd
+    and so disambiguates multiple bridge sessions in one repo — the collision
+    the old cwd-only copy here could not. Then loads the registry entry by
+    thread_id for the session dir, where the auq-pending / auq-answer
+    side-channel files live. A None result means "not a bridge session" and the
+    caller surfaces that without hanging.
     """
-    if not REGISTRY_DIR.is_dir():
+    thread_id = bridge_resolve.resolve(cwd=cwd)
+    if thread_id is None:
         return None
-    # Match on the canonical (symlink-resolved) path: the registry stores the
-    # cwd as the spawn saw it (e.g. /tmp) but os.getcwd() here returns the real
-    # path (e.g. /private/tmp on macOS), so a raw string compare misses. realpath
-    # both sides. realpath("") == getcwd(), so a missing reg cwd must be skipped.
-    cwd = os.path.realpath(cwd)
-    cpid = _claude_ancestor_pid()
-    matches = []   # (registered_at, thread_id, session_dir)
-    for f in REGISTRY_DIR.glob("*.json"):
-        try:
-            reg = json.loads(f.read_text())
-        except Exception:
-            continue
-        rc = reg.get("cwd")
-        if not rc or os.path.realpath(rc) != cwd or reg.get("thread_id") is None:
-            continue
+    try:
+        reg = json.loads((REGISTRY_DIR / "{}.json".format(thread_id)).read_text())
         inbox = reg.get("inbox_path") or ""
-        session_dir = str(Path(inbox).parent) if inbox else ""
-        entry = (str(reg.get("registered_at", "")), str(reg["thread_id"]), session_dir)
-        if cpid is not None and reg.get("claude_pid") == cpid:
-            return entry[1], entry[2]      # exact session-identity match
-        matches.append(entry)
-    if not matches:
+    except (OSError, ValueError):
         return None
-    matches.sort(reverse=True)             # newest registered_at wins (fallback)
-    return matches[0][1], matches[0][2]
+    if not inbox:
+        return None
+    return thread_id, str(Path(inbox).parent)
 
 
 def _chat_id():
