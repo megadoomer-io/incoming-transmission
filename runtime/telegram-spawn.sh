@@ -95,6 +95,48 @@ fi
 [ -x "$CLAUDE_BIN" ]   || { echo "telegram-spawn: claude not executable at $CLAUDE_BIN" >&2; exit 1; }
 [ -n "${TELEGRAM_BRIDGE_BOT_TOKEN:-}" ] || { echo "telegram-spawn: TELEGRAM_BRIDGE_BOT_TOKEN not set" >&2; exit 1; }
 
+# --- programmatic bind: resolve the topic BEFORE launching claude ------------
+# Binding moves off the LLM (it used to live in SKILL.md Steps 2-3 + the pane
+# stamp). Knowing the thread id here lets us (a) inject it as the race-free
+# TELEGRAM_BRIDGE_THREAD_ID spawn binding, (b) stamp the pane option, and
+# (c) write the registry — all without the model. A compaction handoff REUSES the
+# existing topic; a fresh /new creates one now.
+STATE_DIR="${TELEGRAM_BRIDGE_STATE_DIR:-$HOME/.local/state/telegram-bridge}"
+REGISTRY_DIR="$STATE_DIR/registry"
+# chat_id is router-written in state.json; needed to create (and, on failure, close)
+# the forum topic.
+CHAT_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["chat_id"])' "$STATE_DIR/state.json" 2>/dev/null || true)"
+
+if [ -n "$ATTACH_THREAD" ]; then
+    THREAD_ID="$ATTACH_THREAD"          # compaction rollover: reuse the topic
+else
+    [ -n "$CHAT_ID" ] || { echo "telegram-spawn: no chat_id in $STATE_DIR/state.json; cannot create topic" >&2; exit 1; }
+    branch="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
+    [ -n "$branch" ] || branch="nogit"
+    topic_name="$(basename "$dir")@${branch}"
+    # createForumTopic with a small retry — a silent failure here would otherwise
+    # leave a topicless session, so on total failure we abort the spawn instead.
+    THREAD_ID="$(/usr/bin/python3 - "$CHAT_ID" "$topic_name" <<'PY'
+import json, os, sys, time, urllib.request
+chat, name = sys.argv[1], sys.argv[2]
+tok = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN", "")
+data = json.dumps({"chat_id": int(chat), "name": name}).encode()
+for _ in range(3):
+    try:
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/createForumTopic" % tok,
+            data=data, headers={"Content-Type": "application/json"})
+        r = json.load(urllib.request.urlopen(req, timeout=30))
+        if r.get("ok"):
+            print(r["result"]["message_thread_id"]); break
+    except Exception:
+        pass
+    time.sleep(1.5)
+PY
+)"
+    [ -n "$THREAD_ID" ] || { echo "telegram-spawn: createForumTopic failed; not spawning" >&2; exit 1; }
+fi
+
 # Every spawn lands as a WINDOW (a tab) in one shared "claude" tmux session, so
 # `tmux attach -t claude` shows them all as tabs — cycle with prefix + Tab. The
 # window is named "tg:<repo>" so the tab is recognizable AND visibly marked as
@@ -144,7 +186,7 @@ fi
 if [ -n "$ATTACH_THREAD" ]; then
     prompt="You are a compaction replacement for a Telegram-bridged session whose context filled up. Do these IN ORDER, then wait for instructions:
 1. Restore prior working context. The rollover handoff file is at ${RESTORE_FILE}. Run your START hook now: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines).
-2. Invoke the /telegram skill. It will detect TELEGRAM_BRIDGE_ATTACH_THREAD=${ATTACH_THREAD} and attach to that EXISTING topic (skipping topic creation), register ownership, write the handoff-ready marker, wait for the compaction lock to clear, then load the bridge procedure and do an initial drain (it runs no cron — the router drives timing).
+2. Invoke the /telegram skill. This session is ALREADY bound to its topic (the spawn created/reused the topic, wrote the registry, and stamped the pane), so the skill detects that, writes the handoff-ready marker, waits for the compaction lock to clear, then loads the bridge procedure and does an initial drain (it runs no cron — the router drives timing).
 3. Continue the restored work.
 
 ${spawn_mechanism}"
@@ -156,7 +198,7 @@ else
     fi
     prompt="You were spawned by the telegram bridge. Do these IN ORDER, then wait for instructions:
 1. Restore any prior context for this project. Run your START hook: follow the instructions in ~/.telegram-bridge/lifecycle/start.txt (ignore #-comment lines). This is a fresh spawn with no rollover handoff file — if your hook looks for one, that's fine, just carry on.
-2. Invoke the /telegram skill to attach yourself to a Telegram topic.
+2. Invoke the /telegram skill. This session is ALREADY bound to its topic (the spawn created the topic, wrote the registry, and stamped the pane); the skill detects that and loads the bridge procedure.
 3. ${step3}
 
 ${operator_intent}${spawn_mechanism}"
@@ -227,6 +269,11 @@ ENV_WRAP=(
     "PATH=$USER_PATH"
     "TELEGRAM_BRIDGE_BOT_TOKEN=$TELEGRAM_BRIDGE_BOT_TOKEN"
     "TELEGRAM_BRIDGE_SPAWNED=1"
+    # Race-free spawn binding: set BEFORE the pane exists, so the resolver
+    # (bridge_resolve, env-first) resolves this session's topic even in the window
+    # before the pane option is observable. The pane option (stamped below) is the
+    # durable record; this env var closes the spawn-startup race.
+    "TELEGRAM_BRIDGE_THREAD_ID=$THREAD_ID"
     "HOME=$HOME"
 )
 
@@ -269,16 +316,98 @@ if [ -f "$AUQ_MCP_CONFIG" ]; then
     CLAUDE_FLAGS+=(--mcp-config "$AUQ_MCP_CONFIG")
 fi
 
+# Create the window/session and CAPTURE its pane id (-P -F '#{pane_id}') so we can
+# stamp the pane option programmatically. rc is checked separately from pane-id
+# emptiness: a non-zero rc means creation actually failed (clean up the topic we
+# created); a zero rc with an empty pane id is pathological — warn but never tear
+# down a live session.
 if "$TMUX_BIN" has-session -t "=$SHARED" 2>/dev/null; then
     # Target "=$SHARED:" — the EXACT session, trailing colon = "pick the next
     # free window index". A bare "-t $SHARED" makes new-window target index 0,
     # which fails ("create window failed: index 0 in use") once the session
     # already has a window 0 (base-index is 0).
-    "$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" \
-        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
+    set +e
+    PANE_ID="$("$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" -P -F '#{pane_id}' \
+        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt")"
+    rc=$?
+    set -e
 else
-    "$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" \
-        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt"
+    set +e
+    PANE_ID="$("$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" -P -F '#{pane_id}' \
+        /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt")"
+    rc=$?
+    set -e
 fi
 
-echo "telegram-spawn: launched window '$win' in session $SHARED (dir: $dir)"
+if [ "$rc" -ne 0 ]; then
+    # Creation failed. Close the topic WE just created (not a rollover reuse) so a
+    # failed spawn doesn't leak an orphan topic.
+    if [ -z "$ATTACH_THREAD" ] && [ -n "$CHAT_ID" ]; then
+        /usr/bin/python3 - "$CHAT_ID" "$THREAD_ID" <<'PY' || true
+import json, os, sys, urllib.request
+chat, thread = sys.argv[1], sys.argv[2]
+tok = os.environ.get("TELEGRAM_BRIDGE_BOT_TOKEN", "")
+data = json.dumps({"chat_id": int(chat), "message_thread_id": int(thread)}).encode()
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        "https://api.telegram.org/bot%s/closeForumTopic" % tok,
+        data=data, headers={"Content-Type": "application/json"}), timeout=20).read()
+except Exception:
+    pass
+PY
+    fi
+    echo "telegram-spawn: tmux window/session creation failed (rc=$rc)" >&2
+    exit 1
+fi
+
+# --- stamp the pane + write the registry (the programmatic bind) -------------
+# claude is the pane's DIRECT command, so the pane pid IS the claude pid (no tree
+# walk). Stamp the durable pane option; an empty pane id (pathological) just means
+# the option isn't stamped — the env-var binding above still resolves the session.
+CLAUDE_PID=""
+if [ -n "$PANE_ID" ]; then
+    CLAUDE_PID="$("$TMUX_BIN" display-message -p -t "$PANE_ID" '#{pane_pid}' 2>/dev/null || true)"
+    "$TMUX_BIN" set-option -p -t "$PANE_ID" @telegram_thread_id "$THREAD_ID" 2>/dev/null || true
+else
+    echo "telegram-spawn: WARNING could not capture pane id; pane option not stamped (env-var binding still applies)" >&2
+fi
+
+# Write the registry entry LAST so a half-finished spawn never leaves a partial
+# record. transcript_path is left empty here (the transcript doesn't exist until
+# the session starts) — the router backfills it from the SessionStart self-record.
+# On a compaction rollover, carry the prior entry's `spawned` flag forward so an
+# adopted (user-owned) session that rolls over still DETACHES, not reaps, on /end.
+INBOX="/tmp/claude-telegram/sessions/$THREAD_ID/inbox.jsonl"
+mkdir -p "$REGISTRY_DIR" "/tmp/claude-telegram/sessions/$THREAD_ID"
+ROLLOVER=0; [ -n "$ATTACH_THREAD" ] && ROLLOVER=1
+/usr/bin/python3 - "$REGISTRY_DIR" "$THREAD_ID" "$PANE_ID" "$CLAUDE_PID" "$INBOX" "$dir" "$ROLLOVER" <<'PY' || true
+import datetime, json, os, sys
+reg_dir, thread_id, pane_id, claude_pid, inbox, cwd, rollover = sys.argv[1:8]
+path = os.path.join(reg_dir, "%s.json" % thread_id)
+if rollover == "1":
+    # Carry `spawned` forward from the session being replaced (default True if its
+    # entry is gone — most rollovers are /new, which are bridge-owned).
+    try:
+        spawned = bool(json.load(open(path)).get("spawned", True))
+    except Exception:
+        spawned = True
+else:
+    spawned = True   # a fresh /new spawn is bridge-owned
+entry = {
+    "thread_id": int(thread_id),
+    "pane_id": pane_id or None,
+    "claude_pid": int(claude_pid) if claude_pid else None,
+    "inbox_path": inbox,
+    "cwd": cwd,
+    "transcript_path": "",
+    "spawned": spawned,
+    "context": "session attached",
+    "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(entry, fh, indent=2)
+os.replace(tmp, path)
+PY
+
+echo "telegram-spawn: launched window '$win' (pane ${PANE_ID:-?}, topic $THREAD_ID) in session $SHARED (dir: $dir)"
