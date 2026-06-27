@@ -1,7 +1,7 @@
 ---
 name: telegram-bridge
 description: Open a Telegram forum topic bound to this Claude session — messages typed there route to this live session, which replies in-topic with full context.
-version: 1.8.0
+version: 1.9.0
 ---
 
 # /telegram
@@ -257,6 +257,18 @@ gstack `/context-save` + `/context-restore` version. See "Customizing agent
 behavior" in the README. Claude Code's native auto-compact still sits underneath as
 the ultimate safety net if the router's detection is ever down.
 
+**Session↔topic reconciliation (no drift).** The same `context_loop`, on a slower
+~20m cadence, reconciles its two views of the world so they can't silently drift. A
+registry entry whose `claude_pid` is dead (the session exited, or the box rebooted)
+has its forum topic **closed** and the registry entry dropped — so a phone message
+gets the "no session" reply instead of routing into a void — and a ledger topic still
+marked open with no live session behind it is closed too. It uses `closeForumTopic`
+(reversible: you can reopen), which is why it's **always-on**, unlike the irreversible
+delete-reaper. A session mid-rollover (`compacting.lock` present) counts as alive, so
+a handoff is never closed; entries with no `claude_pid` are left alone; the owner is
+alerted in-topic before each close. (`reconcile_sessions_topics` + the pure
+`_reconcile_plan` in `telegram-router.py`.)
+
 **Tuning** (`~/.telegram-bridge/compaction.json`, read live — no restart):
 
 | Field | Default | Meaning |
@@ -265,6 +277,8 @@ the ultimate safety net if the router's detection is ever down.
 | `warn_pct` | `0.75` | Show ⚠️ on the sticky at this fraction |
 | `backstop_seconds` | `300` | Min interval between router re-nudges of an undrained inbox (the missed-push backstop) |
 | `context_interval_seconds` | `90` | How often the router recomputes each gauge, checks the trigger, and checks for undrained inboxes |
+| `reconcile_interval_seconds` | `1200` | How often the router reconciles sessions↔topics (closes orphan topics, drops dead registry entries) |
+| `reconcile_grace_seconds` | `600` | Min age before a registry-less open topic is closed as an orphan (avoids racing a topic still mid-bind) |
 | `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (find + clean up by hand); `true` kills the window outright |
 
 Trigger it manually with `/compact` from the topic; check the gauge any time with
@@ -441,7 +455,10 @@ gated despite a global Bash allowlist. (NOTE: the gate is bridge-MEMBERSHIP, not
 - **Plain text replies**: v1 sends plain text, chunked at 4096 chars. Rich
   formatting (HTML/code blocks) is a later enhancement.
 - **Unattached topics**: messages to a topic with no attached session get a "no
-  session" reply. Use `/new` to spawn a fresh attached session.
+  session" reply. Use `/new` to spawn a fresh attached session. The ~20m
+  reconciliation sweep also closes such topics proactively (and drops the dead
+  registry entry) so they don't accumulate; closing is reversible, so reopen one if
+  you want it back.
 - **Tier-2 coverage**: `Write`/`Edit`/`NotebookEdit`, **risky** Bash, and any
   non-allowlisted `mcp__*` route to Telegram for approval. Safe Bash, reads, and
   allowlisted MCP run via the engine. WebFetch is not gated by the hook (an
