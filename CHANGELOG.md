@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — tmux window reaper
+
+### Added
+- **An opt-in janitor that kills confirmed-dead bridge windows in the shared `claude`
+  tmux session** (issue #6). Two corpse classes: a retired handoff window (renamed
+  `DEAD - <name>` by `kill_old=false`) and an abandoned spawn whose pane has died
+  (`tg:*` with `pane_dead`), each killed after `window_reap_grace_seconds`. The
+  reaper is **opt-in** (`window_reaper_enabled`, default off) because `kill-window`
+  is irreversible — the same reason the topic delete-reaper is opt-in. It only ever
+  targets **bridge-named** windows (`DEAD - ` exact prefix, or `tg:`), so a user's
+  own claude window is never touched, and a **live** `tg:*` spawn (claude still
+  running) is never killed — left for the owner to `/end`, since killing it could
+  discard live work. Posts a one-line summary to the General topic when it acts.
+  This is the tmux-side counterpart to the #7 reconciliation sweep, which cleans the
+  registry/topic side. Pure policy is `_windows_to_reap`; the impure shell is
+  `reap_stale_windows`, wired into `context_loop`. New config:
+  `window_reaper_enabled` (false), `window_reap_grace_seconds` (3600),
+  `window_reap_interval_seconds` (1800). (`runtime/telegram-router.py`; coverage in
+  `tests/test_window_reaper.py`.)
+
 ## Unreleased — session↔topic reconciliation sweep
 
 ### Added

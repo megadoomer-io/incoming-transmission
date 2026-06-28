@@ -99,6 +99,15 @@ CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    # delete); throttled to ~20m. grace avoids racing a topic that is
                    # still mid-bind.
                    "reconcile_interval_seconds": 1200, "reconcile_grace_seconds": 600,
+                   # Window reaper (issue #6): kill confirmed-dead bridge windows in
+                   # the shared tmux session — retired 'DEAD -' handoff windows and
+                   # abandoned 'tg:' spawns whose pane has died — after a grace.
+                   # Opt-in because kill-window is irreversible (the topic
+                   # delete-reaper is opt-in for the same reason). Only ever targets
+                   # bridge-NAMED windows, so a user's own claude window is never
+                   # touched; a live (claude still running) spawn is left for /end.
+                   "window_reaper_enabled": False, "window_reap_grace_seconds": 3600,
+                   "window_reap_interval_seconds": 1800,
                    # Diagnostic: when true, log the raw JSON of every getUpdates
                    # result before dispatch. Read live each batch so it can be
                    # toggled in compaction.json without a restart. Used to answer
@@ -141,6 +150,13 @@ _last_topic_reap = 0.0
 # reconcile_interval_seconds (~20m) rather than every ~90s. Module-global so a
 # router restart re-arms a fresh interval.
 _last_reconcile = 0.0
+# Window reaper (issue #6): throttle timestamp + first-seen dwell map. The reaper
+# kills confirmed-dead bridge windows in the shared tmux session (retired 'DEAD -'
+# handoff windows, and abandoned 'tg:' spawns whose pane died) after a grace.
+# kill-window is irreversible, so the reaper is opt-in (window_reaper_enabled).
+# Both are module-global so a router restart re-arms a fresh interval + grace.
+_last_window_reap = 0.0
+_reap_seen = {}   # window_id -> first_seen monotonic (corpse dwell tracking)
 # Wedge tracking: tkey -> {"sig": <prompt signature>, "first_seen": <monotonic>,
 # "acted": <bool>}. A bridged session can wedge on a native blocking prompt the
 # bridge can't answer remotely (a native AskUserQuestion menu, a trust-folder
@@ -945,6 +961,76 @@ def clear_stale_pane_options():
         log("backstop: cleared stale @telegram_thread_id on DEAD pane {}".format(pane_id))
 
 
+def _windows_to_reap(windows, seen, now_mono, grace_seconds):
+    """Pure window-reaper policy (issue #6). Decide which shared-session tmux windows
+    are confirmed-dead bridge corpses ripe for killing.
+
+    Inputs:
+      windows: iterable of (window_id, window_name, pane_dead:bool) — every window in
+        the shared claude session.
+      seen: {window_id: first_seen_monotonic} accumulated across prior sweeps.
+      now_mono, grace_seconds: a corpse must persist this long before it's reaped.
+
+    Returns (reap, seen_next):
+      reap: window_ids that have been a corpse for >= grace_seconds.
+      seen_next: the pruned/updated first-seen map — a corpse keeps (or gets) its
+        first_seen; a NON-corpse is dropped so a window that stops qualifying re-arms
+        the grace from scratch.
+
+    A window is a corpse when it is bridge-NAMED and confirmed dead:
+      - a retired handoff window (name starts 'DEAD - ' — exact retire prefix, so a
+        user window like 'DEADLINE' is never matched), OR
+      - an abandoned spawn whose pane has died (name starts 'tg:' AND pane_dead).
+    A LIVE 'tg:' spawn (claude still running, pane not dead) is never a corpse — it's
+    left for the owner to /end, since killing it could discard live work."""
+    reap, seen_next = [], {}
+    for wid, wname, pane_dead in windows:
+        corpse = wname.startswith("DEAD - ") or (wname.startswith("tg:") and pane_dead)
+        if not corpse:
+            continue
+        first = seen.get(wid, now_mono)
+        seen_next[wid] = first
+        if (now_mono - first) >= grace_seconds:
+            reap.append(wid)
+    return reap, seen_next
+
+
+def reap_stale_windows(chat_id):
+    """Kill confirmed-dead bridge windows in the shared claude tmux session (issue
+    #6): retired 'DEAD - ' handoff windows and abandoned 'tg:' spawns whose pane has
+    died, each after window_reap_grace_seconds. Opt-in (caller gates on
+    window_reaper_enabled) because kill-window is irreversible. Only ever targets
+    bridge-NAMED windows, so a user's own claude window is never touched; a live spawn
+    is never killed. Posts a one-line summary to the General topic when it acts.
+    Pairs with the #7 reconciliation sweep, which cleans the registry/topic side."""
+    global _reap_seen
+    cfg = load_compaction_cfg()
+    grace = max(60, int(cfg.get("window_reap_grace_seconds", 3600) or 3600))
+    out = _tmux("list-windows", "-t", TMUX_SESSION,
+                "-F", "#{window_id}\t#{window_name}\t#{pane_dead}")
+    windows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        windows.append((parts[0], parts[1], parts[2] == "1"))
+    reap, _reap_seen = _windows_to_reap(windows, _reap_seen, time.monotonic(), grace)
+    if not reap:
+        return
+    name_of = {w[0]: w[1] for w in windows}
+    killed = []
+    for wid in reap:
+        _tmux("kill-window", "-t", wid)
+        killed.append(name_of.get(wid, wid))
+        log("window-reaper: killed stale window {} ({})".format(wid, name_of.get(wid, "?")))
+    if killed and chat_id is not None:
+        try:
+            send_message(chat_id, "🧹 Reaped {} stale tmux window(s): {}".format(
+                len(killed), ", ".join(killed)), thread_id=None)
+        except (urllib.error.URLError, OSError):
+            pass
+
+
 def _nudge_pane(reg, text, kind):
     """Best-effort: send-keys a one-line instruction into the topic's pane (the
     pid-matched session). One line (no embedded newline) so Enter submits exactly
@@ -1316,6 +1402,16 @@ def context_loop():
         if (time.monotonic() - _last_reconcile) >= recon_every:
             reconcile_sessions_topics(sweep_chat_id)
             _last_reconcile = time.monotonic()
+        # Window reaper ("janitor"): kill confirmed-dead bridge windows in the shared
+        # tmux session (retired 'DEAD -' + abandoned 'tg:' dead-pane spawns) after a
+        # grace. Opt-in (kill-window is irreversible). Cleans the tmux side; the
+        # reconcile sweep above cleans the registry/topic side (issue #6 + #7).
+        if cfg.get("window_reaper_enabled"):
+            global _last_window_reap
+            wreap_every = max(300, int(cfg.get("window_reap_interval_seconds", 1800) or 1800))
+            if (time.monotonic() - _last_window_reap) >= wreap_every:
+                reap_stale_windows(sweep_chat_id)
+                _last_window_reap = time.monotonic()
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:
