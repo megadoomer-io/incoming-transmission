@@ -91,6 +91,14 @@ CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    # always on. reap_interval throttles the sweep well below the TTL.
                    "topic_reaper_enabled": False, "topic_ttl_seconds": 604800,
                    "topic_reap_interval_seconds": 3600,
+                   # Session<->topic reconciliation (issue #7): close the forum
+                   # topic of any session that has gone away (dead claude_pid, or a
+                   # ledger-open topic with no live session) so a phone message
+                   # never routes into a void, and drop the dead registry entry.
+                   # Always-on (closeForumTopic is reversible, unlike the reaper's
+                   # delete); throttled to ~20m. grace avoids racing a topic that is
+                   # still mid-bind.
+                   "reconcile_interval_seconds": 1200, "reconcile_grace_seconds": 600,
                    # Diagnostic: when true, log the raw JSON of every getUpdates
                    # result before dispatch. Read live each batch so it can be
                    # toggled in compaction.json without a restart. Used to answer
@@ -128,6 +136,11 @@ _backstop_nudged_at = {}
 # days; sweeping every ~90s would be wasteful). Module-global so a router restart
 # re-arms a fresh interval.
 _last_topic_reap = 0.0
+# Reconciliation throttle (issue #7): monotonic timestamp of the last
+# session<->topic reconcile sweep, so the context loop runs it at most once per
+# reconcile_interval_seconds (~20m) rather than every ~90s. Module-global so a
+# router restart re-arms a fresh interval.
+_last_reconcile = 0.0
 # Wedge tracking: tkey -> {"sig": <prompt signature>, "first_seen": <monotonic>,
 # "acted": <bool>}. A bridged session can wedge on a native blocking prompt the
 # bridge can't answer remotely (a native AskUserQuestion menu, a trust-folder
@@ -1294,6 +1307,15 @@ def context_loop():
                 ttl = max(3600, int(cfg.get("topic_ttl_seconds", 604800) or 604800))
                 reap_topics(sweep_chat_id, ttl)
                 _last_topic_reap = time.monotonic()
+        # Session<->topic reconciliation ("no drift"): close topics whose session
+        # is gone (so a phone message never routes into a void) and drop the dead
+        # registry entry. Reversible (closeForumTopic, not delete), so always-on
+        # unlike the reaper above. Throttled to ~20m — most sweeps skip it.
+        global _last_reconcile
+        recon_every = max(300, int(cfg.get("reconcile_interval_seconds", 1200) or 1200))
+        if (time.monotonic() - _last_reconcile) >= recon_every:
+            reconcile_sessions_topics(sweep_chat_id)
+            _last_reconcile = time.monotonic()
         # Sleep in 1s slices so SIGTERM/shutdown is responsive.
         slept = 0
         while _running and slept < interval:
@@ -1443,6 +1465,141 @@ def delete_forum_topic(chat_id, thread_id):
     except (urllib.error.URLError, OSError) as e:
         log("WARN deleteForumTopic {}: {}".format(thread_id, e))
         return False
+
+
+def close_forum_topic(chat_id, thread_id):
+    """closeForumTopic — CLOSE (not delete) a forum topic. Reversible (an owner can
+    reopen it), which is why reconciliation closes orphans always-on while the
+    delete-reaper stays opt-in. Best-effort; returns True only on an ok response so
+    the caller marks the ledger closed only when the close actually landed."""
+    try:
+        r = api_call("closeForumTopic",
+                     {"chat_id": chat_id, "message_thread_id": thread_id})
+        return bool(r.get("ok"))
+    except (urllib.error.URLError, OSError) as e:
+        log("WARN closeForumTopic {}: {}".format(thread_id, e))
+        return False
+
+
+def _reconcile_plan(entries, ledger, now_epoch, grace_seconds):
+    """Pure reconciliation policy (issue #7): given the current registry + ledger,
+    decide which forum topics to close and which registry entries to drop, so the
+    router's two views of the world can't silently drift.
+
+    Inputs:
+      entries: iterable of (tkey, thread_id:int, alive:bool) — one per registry
+        file that has a thread_id. `alive` folds BOTH pid-liveness AND a mid-handoff
+        guard: a session whose claude_pid is dead is NOT alive, but a session that
+        is compacting (or whose pid can't be assessed) IS treated as alive so a
+        rollover-in-flight is never closed.
+      ledger: topics.json dict (tkey -> record).
+      now_epoch, grace_seconds: the direction-B grace window.
+
+    Returns (close, drop):
+      close: list of (thread_id:int, tkey:str, reason:str), reason in
+        {'session-ended', 'orphan-topic'}.
+      drop:  list of tkey whose registry/<tkey>.json should be unlinked.
+
+    Direction A (registry -> topic): a registry entry that is not alive is a dead
+    session — drop the entry (so a phone message gets the 'no session' reply rather
+    than routing into a void), and close its topic unless the ledger already marks
+    it closed (avoids a redundant close/alert on a topic the owner already closed).
+
+    Direction B (topic -> registry): a ledger topic still 'open' with NO registry
+    entry and a created_at older than grace_seconds is an orphan (its session died
+    and was pruned, e.g. across a reboot) — close it. The grace window avoids racing
+    a topic that was just created and is still mid-bind."""
+    have = {tkey for tkey, _tid, _alive in entries}
+    close, drop = [], []
+    for tkey, tid, alive in entries:
+        if alive:
+            continue
+        drop.append(tkey)
+        if (ledger.get(tkey) or {}).get("state") != "closed":
+            close.append((tid, tkey, "session-ended"))
+    for tkey, rec in (ledger or {}).items():
+        if not isinstance(rec, dict) or rec.get("state") != "open":
+            continue
+        if tkey in have:                       # has a registry entry -> direction A's job
+            continue
+        try:
+            tid = int(rec.get("thread_id") or int(tkey))
+        except (ValueError, TypeError):
+            continue
+        if tid <= 1:                           # guard General / invalid ids
+            continue
+        created = rec.get("created_at")
+        if created is None:                    # can't age -> leave alone
+            continue
+        try:
+            if (now_epoch - int(created)) >= grace_seconds:
+                close.append((tid, tkey, "orphan-topic"))
+        except (ValueError, TypeError):
+            continue
+    return close, drop
+
+
+def reconcile_sessions_topics(chat_id):
+    """Reconcile registry <-> live session <-> forum topic (issue #7). Close the
+    forum topic of any session that has gone away (so a phone message never routes
+    into a void) and drop its registry entry; also close ledger topics with no
+    backing session. closeForumTopic is reversible, so this is always-on (unlike
+    the delete-reaper). No-op without a chat_id. Pure policy lives in
+    _reconcile_plan; this is the impure shell (filesystem + Telegram API)."""
+    if chat_id is None:
+        return
+    registry = {}
+    if REGISTRY_DIR.is_dir():
+        for f in REGISTRY_DIR.glob("*.json"):
+            try:
+                reg = json.loads(f.read_text())
+            except (ValueError, OSError):
+                continue
+            if reg.get("thread_id") is not None:
+                registry[f.stem] = reg
+    entries = []
+    for tkey, reg in registry.items():
+        cpid = reg.get("claude_pid")
+        # Mid-handoff (compacting.lock present) counts as alive: a rollover briefly
+        # has a dead old pid before the replacement re-registers — don't close it.
+        handoff = (INBOX_ROOT / tkey / "compacting.lock").exists()
+        # claude_pid None => can't assess => treat as alive (matches
+        # prune_orphaned_registry: pre-pid-format entries are left alone).
+        alive = cpid is None or _pid_alive(cpid) or handoff
+        entries.append((tkey, int(reg["thread_id"]), alive))
+    ledger = load_ledger()
+    cfg = load_compaction_cfg()
+    grace = max(60, int(cfg.get("reconcile_grace_seconds", 600) or 600))
+    close, drop = _reconcile_plan(entries, ledger, int(time.time()), grace)
+    if not close and not drop:
+        return
+    changed = False
+    for tid, tkey, reason in close:
+        try:
+            if reason == "session-ended":
+                send_message(chat_id, "⚰️ This session has ended — closing the topic. "
+                             "Reopen it, or use /new to start a fresh session.",
+                             thread_id=tid)
+            else:
+                send_message(chat_id, "⚰️ No live session maps to this topic — closing it. "
+                             "Use /new to start a fresh session.", thread_id=tid)
+        except (urllib.error.URLError, OSError):
+            pass
+        if close_forum_topic(chat_id, tid):
+            rec = ledger.get(tkey) or {"thread_id": tid}
+            rec["state"] = "closed"
+            rec["closed_at"] = rec.get("closed_at") or int(time.time())
+            ledger[tkey] = rec
+            changed = True
+            log("reconcile: closed orphan topic {} ({})".format(tkey, reason))
+    if changed:
+        save_ledger(ledger)
+    for tkey in drop:
+        try:
+            (REGISTRY_DIR / "{}.json".format(tkey)).unlink()
+            log("reconcile: dropped dead registry entry {}".format(tkey))
+        except OSError:
+            pass
 
 
 def reap_topics(chat_id, ttl_seconds):

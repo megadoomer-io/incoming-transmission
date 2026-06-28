@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — session↔topic reconciliation sweep
+
+### Added
+- **The router now reconciles sessions against forum topics on a ~20m sweep, so the
+  two views can't silently drift** (issue #7). Two directions: a registry entry
+  whose `claude_pid` is dead (the session exited or the box rebooted) has its forum
+  topic **closed** and the registry entry dropped, so a phone message gets the "no
+  session" reply instead of routing into a void; and a ledger topic still marked
+  `open` with no backing session (aged past a grace window) is closed too. The sweep
+  uses `closeForumTopic` (reversible — an owner can reopen), which is why it is
+  **always-on**, unlike the irreversible delete-reaper. Safety: entries with no
+  `claude_pid` are left alone (matches the startup prune), a session mid-rollover
+  (`compacting.lock` present) is treated as alive so a handoff is never closed, and
+  the owner is alerted in-topic before each close. A close that fails still drops the
+  dead registry entry and leaves the ledger `open` so the next sweep retries. Policy
+  is the pure `_reconcile_plan`; the impure shell is `reconcile_sessions_topics`,
+  wired into `context_loop`. New config: `reconcile_interval_seconds` (1200) and
+  `reconcile_grace_seconds` (600). (`runtime/telegram-router.py`; coverage in
+  `tests/test_reconcile.py`.)
+
 ## Unreleased — drain lock-leak fix
 
 ### Fixed
