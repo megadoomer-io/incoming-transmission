@@ -1,7 +1,7 @@
 ---
 name: telegram-bridge
 description: Open a Telegram forum topic bound to this Claude session — messages typed there route to this live session, which replies in-topic with full context.
-version: 1.9.0
+version: 1.10.0
 ---
 
 # /telegram
@@ -269,6 +269,18 @@ a handoff is never closed; entries with no `claude_pid` are left alone; the owne
 alerted in-topic before each close. (`reconcile_sessions_topics` + the pure
 `_reconcile_plan` in `telegram-router.py`.)
 
+**Window reaper (tmux janitor, opt-in).** Reconciliation cleans the registry/topic
+side; the window reaper cleans the tmux side — it kills confirmed-dead bridge windows
+that pile up in the shared `claude` session. Two corpse classes: a retired handoff
+window (renamed `DEAD - <name>`) and an abandoned spawn whose pane has died (`tg:*`
+with a dead pane), each killed after `window_reap_grace_seconds`. It is **opt-in**
+(`window_reaper_enabled`, default off) because `kill-window` is irreversible — the
+same reason the topic delete-reaper is opt-in. It only targets **bridge-named**
+windows, so a user's own claude window is never touched, and a **live** `tg:*` spawn
+(claude still running) is never killed — `/end` those yourself, since killing live
+work is exactly what the reaper avoids. Posts a one-line summary to General when it
+acts. (`reap_stale_windows` + the pure `_windows_to_reap`.)
+
 **Tuning** (`~/.telegram-bridge/compaction.json`, read live — no restart):
 
 | Field | Default | Meaning |
@@ -279,7 +291,10 @@ alerted in-topic before each close. (`reconcile_sessions_topics` + the pure
 | `context_interval_seconds` | `90` | How often the router recomputes each gauge, checks the trigger, and checks for undrained inboxes |
 | `reconcile_interval_seconds` | `1200` | How often the router reconciles sessions↔topics (closes orphan topics, drops dead registry entries) |
 | `reconcile_grace_seconds` | `600` | Min age before a registry-less open topic is closed as an orphan (avoids racing a topic still mid-bind) |
-| `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (find + clean up by hand); `true` kills the window outright |
+| `window_reaper_enabled` | `false` | Opt-in: kill confirmed-dead bridge windows (`DEAD - *` + dead-pane `tg:*`) in the shared tmux session. Off by default — `kill-window` is irreversible |
+| `window_reap_grace_seconds` | `3600` | How long a dead window must persist before the reaper kills it (lets you inspect its scrollback first) |
+| `window_reap_interval_seconds` | `1800` | How often the window reaper sweeps |
+| `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (the window reaper above can then collect it if enabled); `true` kills the window outright |
 
 Trigger it manually with `/compact` from the topic; check the gauge any time with
 `/context`.
@@ -473,7 +488,8 @@ gated despite a global Bash allowlist. (NOTE: the gate is bridge-MEMBERSHIP, not
   (and the router backstops any miss), so a retired pane never mis-resolves. A
   manually-attached session in a plain terminal still saves, spawns the
   replacement, and hands off, but the old terminal session is left for you to `/end`
-  or close yourself.
+  or close yourself. The opt-in window reaper (above) collects the `DEAD - *` windows
+  left by the rename path once they've sat past the grace.
 - **AskUserQuestion answer shape**: a spawned session asks via the
   `mcp__telegram__AskUserQuestion` MCP tool (native AskUserQuestion is disabled in
   spawns). Single-select returns the chosen label (`str`); **multi-select returns
