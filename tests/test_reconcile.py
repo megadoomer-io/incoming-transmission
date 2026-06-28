@@ -17,6 +17,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 RUNTIME = Path(__file__).resolve().parent.parent / "runtime"
@@ -128,6 +129,37 @@ def test_plan_mixed_scenario():
     assert set(drop) == {"100", "102"}
 
 
+# --- _pane_bound_to_thread: pure pane-binding probe ------------------------
+
+def test_pane_bound_matches_thread():
+    mod = _load_router()
+    out = "%1\t100\n%2\t200\n"
+    assert mod._pane_bound_to_thread(out, "%1", "100") is True
+
+
+def test_pane_bound_wrong_thread_is_false():
+    mod = _load_router()
+    out = "%1\t999\n"                            # pane re-bound to another topic
+    assert mod._pane_bound_to_thread(out, "%1", "100") is False
+
+
+def test_pane_bound_unset_option_is_false():
+    mod = _load_router()
+    out = "%1\t\n"                               # option cleared -> unbound
+    assert mod._pane_bound_to_thread(out, "%1", "100") is False
+
+
+def test_pane_bound_missing_pane_is_false():
+    mod = _load_router()
+    out = "%2\t100\n"                            # the pane is gone (session died)
+    assert mod._pane_bound_to_thread(out, "%1", "100") is False
+
+
+def test_pane_bound_no_pane_id_is_false():
+    mod = _load_router()
+    assert mod._pane_bound_to_thread("%1\t100\n", None, "100") is False
+
+
 # --- reconcile_sessions_topics: impure shell -------------------------------
 
 def _shell_env(mod, monkeypatch, tmp_path):
@@ -150,6 +182,18 @@ def _write_reg(reg_dir, tkey, thread_id, claude_pid):
     (reg_dir / "{}.json".format(tkey)).write_text(json.dumps(
         {"thread_id": thread_id, "claude_pid": claude_pid,
          "inbox_path": "/tmp/x", "cwd": "/p"}))
+
+
+def _write_reg_pane(reg_dir, tkey, thread_id, pane_id, age_seconds=0):
+    """Plant a null-claude_pid entry that carries a pane_id, with its file mtime
+    aged `age_seconds` behind the stubbed clock (1_000_000) so the grace window can
+    be exercised."""
+    p = reg_dir / "{}.json".format(tkey)
+    p.write_text(json.dumps(
+        {"thread_id": thread_id, "claude_pid": None, "pane_id": pane_id,
+         "inbox_path": "/tmp/x", "cwd": "/p"}))
+    when = 1_000_000 - age_seconds
+    os.utime(p, (when, when))
 
 
 def test_shell_dead_session_closes_topic_and_drops_entry(monkeypatch, tmp_path):
@@ -243,3 +287,110 @@ def test_shell_noop_without_chat_id(monkeypatch, tmp_path):
     mod.reconcile_sessions_topics(chat_id=None)
     assert called == []
     assert (reg / "100.json").exists()                         # nothing touched
+
+
+# --- null-pid liveness inferred from the bound pane (the bug fix) -----------
+
+def test_shell_nullpid_dead_pane_past_grace_closes_and_drops(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # null claude_pid, has a pane_id, aged well past the 600s grace; the pane is
+    # gone from list-panes (its session died) -> orphan -> close + drop.
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10_000)
+    monkeypatch.setattr(mod, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(mod, "_tmux", lambda *a: "")           # no panes at all
+    closed, alerts = [], []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message",
+                        lambda *a, **k: alerts.append((a, k)))
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == [100]
+    assert len(alerts) == 1
+    assert not (reg / "100.json").exists()                     # entry dropped
+    assert mod.load_ledger()["100"]["state"] == "closed"
+
+
+def test_shell_nullpid_live_bound_pane_untouched(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # null claude_pid, aged past grace, BUT the pane is present and still bound to
+    # this thread -> alive -> leave alone.
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10_000)
+    monkeypatch.setattr(mod, "_tmux", lambda *a: "%1\t100\n")
+    closed = []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == []
+    assert (reg / "100.json").exists()
+
+
+def test_shell_nullpid_pane_rebound_to_other_thread_closes(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # Pane is alive but now carries a DIFFERENT thread's binding (re-bound) -> this
+    # entry's session is gone -> close + drop (past grace).
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10_000)
+    monkeypatch.setattr(mod, "_tmux", lambda *a: "%1\t555\n")
+    closed = []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == [100]
+    assert not (reg / "100.json").exists()
+
+
+def test_shell_nullpid_dead_pane_within_grace_untouched(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # Pane is gone but the entry is fresh (within the 600s grace) -> still mid-bind,
+    # leave it alone.
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10)
+    monkeypatch.setattr(mod, "_tmux", lambda *a: "")
+    closed = []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == []
+    assert (reg / "100.json").exists()
+
+
+def test_shell_nullpid_no_pane_id_left_alone_backcompat(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # null claude_pid AND no pane_id (truly unassessable / pre-pane format), aged
+    # past grace -> MUST still be left alone (backward compat). _tmux must not even
+    # be consulted (no pane to probe).
+    _write_reg(reg, "100", 100, None)
+    tmux_calls = []
+    monkeypatch.setattr(mod, "_tmux", lambda *a: tmux_calls.append(a) or "")
+    closed = []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == []
+    assert (reg / "100.json").exists()
+    assert tmux_calls == []
+
+
+def test_shell_nullpid_dead_pane_past_grace_but_handoff_untouched(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # Dead/gone pane, past grace, but a compacting.lock marks a handoff in flight ->
+    # never close during a rollover.
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10_000)
+    (tmp_path / "sessions" / "100").mkdir()
+    (tmp_path / "sessions" / "100" / "compacting.lock").touch()
+    monkeypatch.setattr(mod, "_tmux", lambda *a: "")
+    closed = []
+    monkeypatch.setattr(mod, "close_forum_topic",
+                        lambda chat_id, tid: closed.append(tid) or True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    assert closed == []
+    assert (reg / "100.json").exists()
