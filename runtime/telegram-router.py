@@ -108,6 +108,21 @@ CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    # touched; a live (claude still running) spawn is left for /end.
                    "window_reaper_enabled": False, "window_reap_grace_seconds": 3600,
                    "window_reap_interval_seconds": 1800,
+                   # Hung-MCP-tool recovery (issue #18): a spawned bridge session
+                   # can hang on an MCP tool call (e.g. a Gmail MCP needing headless
+                   # OAuth) — it's BUSY (so the idle-only push/backstop can't reach
+                   # it) and it's NOT a native-prompt wedge (detect_wedge can't see
+                   # it), so nothing self-heals it. The signature requires ALL of:
+                   # undrained inbox, the transcript's last tool_use has no matching
+                   # tool_result, AND no transcript progress for a dwell. Recovery is
+                   # the SAME safe action as the native-prompt wedge sweep: send Esc
+                   # (only ever cancels a tool call, never approves), inject a trusted
+                   # inbox note, nudge a drain, and alert the topic. OPT-IN (default
+                   # off) because issue #18 is owner-DEFERRED — the human decides when
+                   # to enable it. The dwell defaults to wedge_dwell_seconds so it
+                   # shares the native wedge's well-tuned grace.
+                   "mcp_hang_recovery_enabled": False,
+                   "mcp_hang_dwell_seconds": 300,
                    # Diagnostic: when true, log the raw JSON of every getUpdates
                    # result before dispatch. Read live each batch so it can be
                    # toggled in compaction.json without a restart. Used to answer
@@ -165,6 +180,16 @@ _reap_seen = {}   # window_id -> first_seen monotonic (corpse dwell tracking)
 # cancels, never approves — safe to do blind) and tells the owner. In-memory so a
 # router restart re-arms a clean episode. Replaces the old standalone watchdog.
 _wedge_state = {}
+# Hung-MCP-tool tracking (issue #18): tkey -> {"tool_id": <outstanding tool_use id>,
+# "first_seen": <monotonic>, "acted": <bool>}. A BUSY bridged session can hang on
+# an MCP tool call that never returns a result (e.g. a Gmail MCP wanting headless
+# OAuth). It isn't a native-prompt wedge (no Esc-to-cancel footer for detect_wedge
+# to see) and the idle-only backstop can't reach a busy pane, so nothing self-heals
+# it. The context loop watches ONLY bridged panes with an undrained inbox whose
+# transcript shows an outstanding tool_use and no progress for a dwell, then (opt-in)
+# sends Escape — exactly the native wedge's safe cancel. In-memory so a router
+# restart re-arms a clean episode (matches _wedge_state / _reap_seen).
+_hung_tool_state = {}
 
 
 def start_caffeinate():
@@ -1298,6 +1323,197 @@ def handle_wedge(reg, tkey, chat_id, dwell_s):
             thread_id=thread_id)
 
 
+# --- hung-MCP-tool recovery (issue #18, owner-deferred -> opt-in) ----------
+#
+# Distinct failure mode from the native-prompt wedge above: a BUSY bridged
+# session hangs on an MCP tool call that never returns (a Gmail MCP wanting
+# headless OAuth, a server that stalls). There is no Esc-to-cancel footer for
+# detect_wedge to match, and the idle-only push/backstop can't reach a busy pane,
+# so nothing self-heals it — today the owner manually sends Esc.
+#
+# The detection signature deliberately requires ALL of three independent signals
+# (NEVER bare wall-clock), so a genuinely-progressing long task is never cut:
+#   (1) the bridged pane has an UNDRAINED inbox (something is waiting), AND
+#   (2) the transcript's last tool_use has NO matching tool_result, AND
+#   (3) no transcript PROGRESS (new assistant turn / tool_result) for a dwell.
+# Recovery is the SAME safe action as handle_wedge: Esc (cancel only, never an
+# approval), a trusted inbox note, a drain nudge, and a 🪤 alert. Opt-in/off by
+# default because issue #18 is owner-deferred.
+
+
+def _scan_outstanding_tool(transcript_path, json_loads=None):
+    """Pure scan of a Claude Code transcript JSONL. Returns
+    (outstanding_tool_id, last_progress_ts):
+
+      outstanding_tool_id — id of the final assistant `tool_use` that has NO
+        later matching `tool_result`, or None if the last tool_use was answered
+        (or there were no tool_use blocks at all).
+      last_progress_ts    — the `timestamp` string of the newest record that
+        counts as PROGRESS: an assistant turn or a user tool_result. Non-progress
+        appends (a `queue-operation` / queued-input line, meta records, anything
+        that bumps file mtime without advancing the turn) are ignored, so a busy
+        wedge can't be masked by mtime alone. None if nothing progressed.
+
+    Robust to malformed lines (skipped) and missing files (returns (None, None)).
+    json_loads is injectable for tests."""
+    if json_loads is None:
+        json_loads = json.loads
+    last_tool_use_id = None          # newest assistant tool_use id seen
+    answered = set()                 # tool_use ids that got a tool_result
+    last_progress_ts = None
+    try:
+        with open(transcript_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json_loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                rtype = obj.get("type")
+                # Only assistant turns and user tool_results are progress. A
+                # 'queue-operation' (or any other meta/system append) bumps mtime
+                # but is explicitly NOT progress — that's the whole point of
+                # gating on transcript content rather than file mtime.
+                if rtype not in ("assistant", "user"):
+                    continue
+                msg = obj.get("message") or {}
+                content = msg.get("content")
+                blocks = content if isinstance(content, list) else []
+                if rtype == "assistant":
+                    # An assistant turn is progress regardless of its blocks.
+                    ts = obj.get("timestamp")
+                    if ts:
+                        last_progress_ts = ts
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            tid = b.get("id")
+                            if tid:
+                                last_tool_use_id = tid
+                elif rtype == "user":
+                    # A user turn is progress ONLY if it carries a tool_result
+                    # (a plain queued/owner message isn't the tool returning).
+                    saw_result = False
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            saw_result = True
+                            ru = b.get("tool_use_id")
+                            if ru:
+                                answered.add(ru)
+                    if saw_result:
+                        ts = obj.get("timestamp")
+                        if ts:
+                            last_progress_ts = ts
+    except OSError:
+        return (None, None)
+    outstanding = last_tool_use_id if (last_tool_use_id and
+                                       last_tool_use_id not in answered) else None
+    return (outstanding, last_progress_ts)
+
+
+def detect_hung_tool(reg, seen, now_mono, dwell_s,
+                     scan=None, undrained=None):
+    """Pure-ish policy: is this bridged topic a HUNG-MCP-TOOL wedge ripe to clear?
+
+    Returns (action, seen_next) where action is the outstanding tool_use id to
+    cancel (truthy -> act) or None (do nothing), and seen_next is the updated
+    first-seen map for the caller to store back (mirrors _windows_to_reap). The
+    in-memory map keys on tkey+tool_id so a NEW outstanding tool re-arms a clean
+    dwell, and a router restart (empty map) re-arms from scratch.
+
+    Detection requires ALL THREE signals (never bare wall-clock):
+      undrained inbox  +  outstanding tool_use (no result)  +  no transcript
+      progress since the tool_use first went outstanding, for >= dwell.
+    Any one missing clears the episode. scan/undrained are injectable for tests."""
+    if scan is None:
+        scan = _scan_outstanding_tool
+    if undrained is None:
+        undrained = undrained_count
+    tkey = Path(reg.get("inbox_path", "")).parent.name
+    seen = dict(seen)
+    # Signal 1: an undrained inbox. A drained inbox means nothing is waiting on
+    # this session, so even a slow tool is not "hanging the bridge".
+    if undrained(reg) <= 0:
+        seen.pop(tkey, None)
+        return (None, seen)
+    tp = reg.get("transcript_path")
+    if not tp:
+        seen.pop(tkey, None)
+        return (None, seen)
+    # Signals 2+3: outstanding tool_use, and whether the transcript has advanced.
+    outstanding, last_progress_ts = scan(tp)
+    if not outstanding:
+        seen.pop(tkey, None)                 # last tool_use was answered -> healthy
+        return (None, seen)
+    prev = seen.get(tkey)
+    # A different outstanding tool, or first sight, (re)arms a clean dwell and
+    # remembers the progress watermark at arm time.
+    if (prev is None or prev.get("tool_id") != outstanding
+            or prev.get("last_progress_ts") != last_progress_ts):
+        seen[tkey] = {"tool_id": outstanding, "first_seen": now_mono,
+                      "last_progress_ts": last_progress_ts, "acted": False}
+        return (None, seen)
+    if prev.get("acted"):
+        return (None, seen)                  # already cancelled this episode
+    if (now_mono - prev.get("first_seen", now_mono)) < dwell_s:
+        return (None, seen)                  # outstanding, but within the dwell
+    # Ripe: undrained + outstanding tool_use + no progress for >= dwell.
+    return (outstanding, seen)
+
+
+def handle_hung_tool(reg, tkey, chat_id, dwell_s):
+    """Detect + auto-clear a BUSY bridged session hung on an MCP tool call (issue
+    #18). Opt-in caller (mcp_hang_recovery_enabled); only ever sends Escape, the
+    same safe cancel as handle_wedge. Skips a topic with a permission in flight
+    (the hook owns that) and a session whose pane can't be resolved."""
+    global _hung_tool_state
+    cpid = reg.get("claude_pid")
+    thread_id = reg.get("thread_id")
+    if not cpid or thread_id is None:
+        return
+    if (INBOX_ROOT / tkey / "perm-pending.json").exists():
+        _hung_tool_state.pop(tkey, None)
+        return
+    pane = _pane_for_claude_pid(int(cpid))
+    if not pane:
+        _hung_tool_state.pop(tkey, None)
+        return
+    action, _hung_tool_state = detect_hung_tool(
+        reg, _hung_tool_state, time.monotonic(), dwell_s)
+    if not action:
+        return
+    prev = _hung_tool_state.get(tkey, {})
+    mins = int((time.monotonic() - prev.get("first_seen", time.monotonic())) // 60)
+    _tmux("send-keys", "-t", pane, "Escape")
+    prev["acted"] = True
+    _hung_tool_state[tkey] = prev
+    log("hung-tool: cancelled topic {} pane {} tool={} dwell~{}m".format(
+        thread_id, pane, action, mins))
+    inject_inbox_note(
+        reg,
+        "[bridge] A stuck tool call (no result for ~{}m) was auto-cancelled "
+        "(Esc) — it looked hung (an MCP tool waiting on input the bridge can't "
+        "provide, e.g. headless OAuth). Esc only CANCELS the call. Retry, take "
+        "another approach, or if you need owner input ASK in this topic "
+        "(telegram-send.sh) — don't block on a native/headless prompt.".format(mins),
+        from_id=0, username="bridge")
+    # Nudge a drain so the cancellation note (and any waiting inbox) is read once
+    # the pane settles. Unlike the native-wedge case there is no menu still
+    # clearing under the Esc, so a nudge is safe here.
+    wake_session(reg)
+    if chat_id is not None:
+        send_message(
+            chat_id,
+            "🪤 Auto-cleared a hung tool call in this session (~{}m with no "
+            "result). It was blocking and the session is busy, so I sent Esc to "
+            "cancel it. The session will retry or ask here — reply to steer it."
+            .format(mins),
+            thread_id=thread_id)
+
+
 def context_loop():
     """Daemon thread: the router's timing engine, OFF the getUpdates path (a big
     transcript scan or a re-nudge must never stall the message pump). On each
@@ -1321,6 +1537,11 @@ def context_loop():
         poll_lock_ttl = max(60, int(cfg.get("poll_lock_ttl_seconds", 1800) or 1800))
         handoff_lock_ttl = max(60, int(cfg.get("handoff_lock_ttl_seconds", 600) or 600))
         wedge_dwell = max(60, int(cfg.get("wedge_dwell_seconds", 300) or 300))
+        # Hung-MCP-tool recovery (issue #18) — opt-in/off (owner-deferred). Dwell
+        # defaults to the native wedge's well-tuned grace.
+        mcp_hang_on = bool(cfg.get("mcp_hang_recovery_enabled"))
+        mcp_hang_dwell = max(60, int(cfg.get("mcp_hang_dwell_seconds", wedge_dwell)
+                                     or wedge_dwell))
         # chat_id (for owner wedge alerts) read once per sweep — cheap small file.
         sweep_chat_id = load_state().get("chat_id")
         # Backstop the pane-keyed binding once per sweep: unset @telegram_thread_id
@@ -1382,6 +1603,11 @@ def context_loop():
                 # pane and may transiently look like a prompt).
                 if not lock.exists():
                     handle_wedge(reg, tkey, sweep_chat_id, wedge_dwell)
+                    # Hung-MCP-tool watch (issue #18): a BUSY session stuck on an
+                    # MCP tool call detect_wedge can't see (no native footer).
+                    # Opt-in/off (owner-deferred); same compacting.lock guard.
+                    if mcp_hang_on:
+                        handle_hung_tool(reg, tkey, sweep_chat_id, mcp_hang_dwell)
         # Topic reaper ("tidy forum"): TTL-delete forum topics closed longer than
         # the TTL so ended/rolled-over sessions don't pile up closed topics. Opt-in
         # (deleteForumTopic is irreversible) and throttled well below the TTL, so
