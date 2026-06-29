@@ -1,0 +1,28 @@
+name: Tests
+
+# Runs the dev test suite (shell-syntax checks + pytest) on every PR and on
+# pushes to main. The bridge runtime is stdlib-only; the only dependency CI
+# needs is uv, which provisions Python (>=3.9 per pyproject) and the dev-group
+# pytest from uv.lock. Mirrors `make test` exactly so local and CI agree.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run test suite (shell syntax + pytest)
+        run: make test
