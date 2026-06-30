@@ -118,6 +118,13 @@ compaction handoff (PAK transfer), and the Tier-2 permission round-trip.
   + redirect** (your free-text reaches the session), or **⛔ Deny**. Default posture
   is `spawned_mode: "risk-tiered"`; `auto-allow` (no round-trip) is opt-in.
 - **Images** — attach a photo in the topic; the session reads it.
+- **Self-healing** — the router's `context_loop` (no extra daemons) reconciles
+  sessions↔topics so the two can't drift (closes orphan topics, drops dead registry
+  entries), and auto-clears a session wedged on a native prompt nobody can answer
+  remotely (sends Esc after a dwell, then alerts). Two opt-in janitors go further: a
+  window reaper that kills confirmed-dead tmux windows, and recovery for a session
+  hung on an MCP tool call that never returns — both off by default since they take
+  irreversible/Esc actions.
 
 ## Requirements
 
@@ -196,7 +203,7 @@ Typed by you in a topic:
 | `/status` | session cwd + processed count |
 | `/context` | live context gauge (non-destructive) |
 | `/compact` | roll this session over to a fresh one now (PAK transfer) |
-| `/end` | detach: close the topic, remove the cron + registry |
+| `/end` | detach: close the topic, remove the registry (the session runs no cron) |
 | `/dir <name\|path>` | change working dir (alias from `dir-aliases.json` or literal) |
 | `/dirs` | list directory aliases |
 
@@ -280,7 +287,7 @@ Early release. Beyond the [Caveats](#caveats), these specific items are known:
 | File (`~/.telegram-bridge/`) | Purpose |
 |------------------------------|---------|
 | `dir-aliases.json` | short names → paths for `/dir` and `/new` (yours; gitignored) |
-| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds`; topic reaper: `topic_reaper_enabled` (default off — `deleteForumTopic` is irreversible), `topic_ttl_seconds` (default 7d), `topic_reap_interval_seconds` |
+| `compaction.json` | `trigger_pct`, `warn_pct`, `kill_old`, `backstop_seconds`, `context_interval_seconds`, `poll_lock_ttl_seconds`, `handoff_lock_ttl_seconds`; reconciliation: `reconcile_interval_seconds`, `reconcile_grace_seconds`; wedge auto-clear: `wedge_dwell_seconds`; topic reaper: `topic_reaper_enabled` (default off — `deleteForumTopic` is irreversible), `topic_ttl_seconds` (default 7d), `topic_reap_interval_seconds`; window reaper: `window_reaper_enabled` (default off — `kill-window` is irreversible), `window_reap_grace_seconds`, `window_reap_interval_seconds`; hung-MCP recovery: `mcp_hang_recovery_enabled` (default off), `mcp_hang_dwell_seconds` |
 | `permissions.json` | bridge-session permission posture: `risk-tiered` (default), `ask`, or `auto-allow` |
 | `spawned-allow.json` | persisted "always allow" rules (grown by the hook on ✅ Always allow; auditable JSON) |
 | `lifecycle/{style,start,save,end}.txt` | per-event behavior hooks (read live; gitignored). See [Customizing agent behavior](#customizing-agent-behavior) |
