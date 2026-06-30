@@ -1700,7 +1700,17 @@ def reconcile_sessions_topics(chat_id):
             pane_id = reg.get("pane_id")
             if pane_id and not handoff:
                 if _panes_out is None:
-                    _panes_out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+                    # Cross-session ("-a"), NOT scoped to TMUX_SESSION: a keyboard
+                    # `/telegram` self-bind (bridge_bind._self_bind_main) binds
+                    # $TMUX_PANE in WHATEVER tmux session the user is in, often not
+                    # the shared "claude" one, and can store claude_pid=None when its
+                    # pid capture fails. A session-scoped probe would miss that live
+                    # foreign-session pane, fall through to the mtime grace, and wrongly
+                    # close its topic. Matching is by exact pane_id + binding, so "-a"
+                    # adds no false positives. (The session-scoped list-panes probes
+                    # elsewhere are deliberate — they only operate on bridge-managed
+                    # windows in the shared session.)
+                    _panes_out = _tmux("list-panes", "-a",
                                        "-F", "#{pane_id}\t#{@telegram_thread_id}")
                 bound = _pane_bound_to_thread(_panes_out, pane_id, tkey)
                 if bound:

@@ -343,6 +343,32 @@ def test_shell_nullpid_pane_rebound_to_other_thread_closes(monkeypatch, tmp_path
     assert not (reg / "100.json").exists()
 
 
+def test_shell_nullpid_probe_is_cross_session(monkeypatch, tmp_path):
+    mod = _load_router()
+    reg = _shell_env(mod, monkeypatch, tmp_path)
+    # The null-pid liveness probe MUST be cross-session ("-a"), not scoped to
+    # TMUX_SESSION: a keyboard /telegram self-bind can live in a FOREIGN tmux session
+    # with claude_pid=None, and a session-scoped probe would miss its live pane, fall
+    # through to the mtime grace, and wrongly close the topic. The other list-panes
+    # probes stay session-scoped on purpose, so this captures _tmux args to lock the
+    # scope of THIS probe (the prior nullpid tests stub _tmux ignoring its args, so
+    # they can't catch a scope regression).
+    _write_reg_pane(reg, "100", 100, "%1", age_seconds=10_000)
+    calls = []
+
+    def _capture(*a):
+        calls.append(a)
+        return "%1\t100\n"          # present + bound -> alive (nothing should close)
+
+    monkeypatch.setattr(mod, "_tmux", _capture)
+    monkeypatch.setattr(mod, "close_forum_topic", lambda chat_id, tid: True)
+    monkeypatch.setattr(mod, "send_message", lambda *a, **k: None)
+    mod.reconcile_sessions_topics(chat_id=42)
+    probe = next(c for c in calls if c and c[0] == "list-panes")
+    assert "-a" in probe                       # cross-session
+    assert "-s" not in probe and "-t" not in probe   # NOT scoped to TMUX_SESSION
+
+
 def test_shell_nullpid_dead_pane_within_grace_untouched(monkeypatch, tmp_path):
     mod = _load_router()
     reg = _shell_env(mod, monkeypatch, tmp_path)
