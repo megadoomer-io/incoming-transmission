@@ -13,6 +13,32 @@
   recognized and reaped during the transition (`runtime/telegram-router.py`; coverage
   in `tests/test_window_reaper.py`, `tests/test_attach.py`).
 
+## Unreleased — hung-MCP-tool recovery (opt-in, owner-deferred)
+
+### Added
+- **An opt-in sweep that auto-clears a BUSY bridge session hung on an MCP tool
+  call** (issue #18). Distinct from the native-prompt wedge sweep: a session can
+  hang on an MCP tool that never returns (e.g. a Gmail MCP wanting headless OAuth).
+  It's BUSY (so the idle-only push/backstop can't reach it) and it's NOT a native
+  prompt (so `detect_wedge`'s signatures don't match), so nothing self-heals it —
+  manual recovery today is sending Esc to the pane. Detection is **gated to MCP tool
+  calls** (the outstanding `tool_use` name starts with `mcp__`) so a legitimately
+  long `Bash` / `WebFetch` / native call is never cancelled — only the MCP hang class
+  from #18 is in scope. It fires when an **undrained inbox** coincides with an
+  outstanding MCP `tool_use` that has no matching `tool_result` past a dwell, and
+  skips a topic that already has a permission OR AskUserQuestion pending
+  (`perm-pending.json` / `auq-pending.json`) so it never cancels the owner's own
+  in-flight question. Recovery is the SAME safe action as the native wedge sweep:
+  send `Escape` (only ever cancels a tool call, never approves), inject a trusted
+  inbox note, nudge a drain, and post a 🪤 alert to the topic. In-memory episode
+  tracking re-arms a clean episode on router restart. **Opt-in, default off**
+  (`mcp_hang_recovery_enabled`) because issue #18 is **owner-deferred** — the human
+  decides when to enable it. Pure scan is `_scan_outstanding_tool` and pure policy is
+  `detect_hung_tool`; the impure shell is `handle_hung_tool`, wired into
+  `context_loop` behind the flag and the same `compacting.lock` handoff guard. New
+  config: `mcp_hang_recovery_enabled` (false), `mcp_hang_dwell_seconds` (300).
+  (`runtime/telegram-router.py`; coverage in `tests/test_hung_tool.py`.)
+
 ## Unreleased — tmux window reaper
 
 ### Added
