@@ -101,7 +101,7 @@ CONFIG_DEFAULTS = {"trigger_pct": 0.85, "warn_pct": 0.75, "kill_old": False,
                    "reconcile_interval_seconds": 1200, "reconcile_grace_seconds": 600,
                    # Window reaper (issue #6): kill confirmed-dead bridge windows in
                    # the shared tmux session — retired 'DEAD -' handoff windows and
-                   # abandoned 'tg:' spawns whose pane has died — after a grace.
+                   # abandoned 'tg-' spawns whose pane has died — after a grace.
                    # Opt-in because kill-window is irreversible (the topic
                    # delete-reaper is opt-in for the same reason). Only ever targets
                    # bridge-NAMED windows, so a user's own claude window is never
@@ -152,7 +152,7 @@ _last_topic_reap = 0.0
 _last_reconcile = 0.0
 # Window reaper (issue #6): throttle timestamp + first-seen dwell map. The reaper
 # kills confirmed-dead bridge windows in the shared tmux session (retired 'DEAD -'
-# handoff windows, and abandoned 'tg:' spawns whose pane died) after a grace.
+# handoff windows, and abandoned 'tg-' spawns whose pane died) after a grace.
 # kill-window is irreversible, so the reaper is opt-in (window_reaper_enabled).
 # Both are module-global so a router restart re-arms a fresh interval + grace.
 _last_window_reap = 0.0
@@ -875,11 +875,12 @@ def list_unattached_claude_panes():
             continue
         pane_id, widx, wname, curcmd, cwd = parts
         # Adopt only LIVE, user claude sessions in normally-named windows. Skip
-        # bridge-managed windows (tg:* — the bridge's domain; an unregistered one is
+        # bridge-managed windows (tg-* — the bridge's domain; an unregistered one is
         # a STALE bridge session, a #6 reap concern, not an adopt candidate) and
-        # retired windows (DEAD ...).
+        # retired windows (DEAD ...). The legacy "tg:" prefix is still matched for
+        # windows spawned before the tmux-3.7 colon rename (see telegram-spawn.sh).
         if ("claude" in curcmd.lower()
-                and not wname.startswith("tg:")
+                and not wname.startswith(("tg-", "tg:"))
                 and not wname.startswith("DEAD")):
             claude_panes.append((pane_id, widx, _pane_label(cwd, wname)))
     bridged = set()
@@ -980,12 +981,13 @@ def _windows_to_reap(windows, seen, now_mono, grace_seconds):
     A window is a corpse when it is bridge-NAMED and confirmed dead:
       - a retired handoff window (name starts 'DEAD - ' — exact retire prefix, so a
         user window like 'DEADLINE' is never matched), OR
-      - an abandoned spawn whose pane has died (name starts 'tg:' AND pane_dead).
-    A LIVE 'tg:' spawn (claude still running, pane not dead) is never a corpse — it's
+      - an abandoned spawn whose pane has died (name starts 'tg-' AND pane_dead).
+        The legacy 'tg:' prefix is still matched for pre-tmux-3.7 spawns.
+    A LIVE 'tg-' spawn (claude still running, pane not dead) is never a corpse — it's
     left for the owner to /end, since killing it could discard live work."""
     reap, seen_next = [], {}
     for wid, wname, pane_dead in windows:
-        corpse = wname.startswith("DEAD - ") or (wname.startswith("tg:") and pane_dead)
+        corpse = wname.startswith("DEAD - ") or (wname.startswith(("tg-", "tg:")) and pane_dead)
         if not corpse:
             continue
         first = seen.get(wid, now_mono)

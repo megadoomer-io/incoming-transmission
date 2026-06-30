@@ -272,11 +272,12 @@ alerted in-topic before each close. (`reconcile_sessions_topics` + the pure
 **Window reaper (tmux janitor, opt-in).** Reconciliation cleans the registry/topic
 side; the window reaper cleans the tmux side — it kills confirmed-dead bridge windows
 that pile up in the shared `claude` session. Two corpse classes: a retired handoff
-window (renamed `DEAD - <name>`) and an abandoned spawn whose pane has died (`tg:*`
+window (renamed `DEAD - <name>`) and an abandoned spawn whose pane has died (`tg-*`
 with a dead pane), each killed after `window_reap_grace_seconds`. It is **opt-in**
 (`window_reaper_enabled`, default off) because `kill-window` is irreversible — the
 same reason the topic delete-reaper is opt-in. It only targets **bridge-named**
-windows, so a user's own claude window is never touched, and a **live** `tg:*` spawn
+windows (`tg-*`, plus the legacy `tg:*` from before the tmux-3.7 colon rename), so a
+user's own claude window is never touched, and a **live** `tg-*` spawn
 (claude still running) is never killed — `/end` those yourself, since killing live
 work is exactly what the reaper avoids. Posts a one-line summary to General when it
 acts. (`reap_stale_windows` + the pure `_windows_to_reap`.)
@@ -291,7 +292,7 @@ acts. (`reap_stale_windows` + the pure `_windows_to_reap`.)
 | `context_interval_seconds` | `90` | How often the router recomputes each gauge, checks the trigger, and checks for undrained inboxes |
 | `reconcile_interval_seconds` | `1200` | How often the router reconciles sessions↔topics (closes orphan topics, drops dead registry entries) |
 | `reconcile_grace_seconds` | `600` | Min age before a registry-less open topic is closed as an orphan (avoids racing a topic still mid-bind) |
-| `window_reaper_enabled` | `false` | Opt-in: kill confirmed-dead bridge windows (`DEAD - *` + dead-pane `tg:*`) in the shared tmux session. Off by default — `kill-window` is irreversible |
+| `window_reaper_enabled` | `false` | Opt-in: kill confirmed-dead bridge windows (`DEAD - *` + dead-pane `tg-*`) in the shared tmux session. Off by default — `kill-window` is irreversible |
 | `window_reap_grace_seconds` | `3600` | How long a dead window must persist before the reaper kills it (lets you inspect its scrollback first) |
 | `window_reap_interval_seconds` | `1800` | How often the window reaper sweeps |
 | `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (the window reaper above can then collect it if enabled); `true` kills the window outright |

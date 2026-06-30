@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — fix: tmux 3.7 rejects ":" in window names
+
+### Fixed
+- **`/new` spawned every window with a `tg:` prefix, which tmux 3.7 rejects
+  (`invalid window name`), breaking all session creation.** tmux tightened
+  window-name validation to disallow `:` (its `session:window` target delimiter);
+  the `tg:` prefix had been latent since the smart-router redesign and only broke
+  on the tmux upgrade. The spawn window prefix is now `tg-` (`runtime/telegram-spawn.sh`).
+  The router's bridge-window recognition (attach-skip and corpse detection) matches
+  **both** `tg-` and the legacy `tg:` so windows created before the rename are still
+  recognized and reaped during the transition (`runtime/telegram-router.py`; coverage
+  in `tests/test_window_reaper.py`, `tests/test_attach.py`).
+
 ## Unreleased — tmux window reaper
 
 ### Added
