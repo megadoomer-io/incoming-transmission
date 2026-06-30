@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased — fix: tmux 3.7 rejects ":" in window names
+## v1.0.0 — 2026-06-30
 
-### Fixed
+First tagged release of the Telegram bridge ("incoming-transmission"). Everything
+below — through the initial scaffold — ships in 1.0.0; sections are grouped by
+feature area.
+
+### fix: tmux 3.7 rejects ":" in window names
+
+#### Fixed
 - **`/new` spawned every window with a `tg:` prefix, which tmux 3.7 rejects
   (`invalid window name`), breaking all session creation.** tmux tightened
   window-name validation to disallow `:` (its `session:window` target delimiter);
@@ -13,9 +19,9 @@
   recognized and reaped during the transition (`runtime/telegram-router.py`; coverage
   in `tests/test_window_reaper.py`, `tests/test_attach.py`).
 
-## Unreleased — hung-MCP-tool recovery (opt-in, owner-deferred)
+### hung-MCP-tool recovery (opt-in, owner-deferred)
 
-### Added
+#### Added
 - **An opt-in sweep that auto-clears a BUSY bridge session hung on an MCP tool
   call** (issue #18). Distinct from the native-prompt wedge sweep: a session can
   hang on an MCP tool that never returns (e.g. a Gmail MCP wanting headless OAuth).
@@ -39,9 +45,9 @@
   config: `mcp_hang_recovery_enabled` (false), `mcp_hang_dwell_seconds` (300).
   (`runtime/telegram-router.py`; coverage in `tests/test_hung_tool.py`.)
 
-## Unreleased — tmux window reaper
+### tmux window reaper
 
-### Added
+#### Added
 - **An opt-in janitor that kills confirmed-dead bridge windows in the shared `claude`
   tmux session** (issue #6). Two corpse classes: a retired handoff window (renamed
   `DEAD - <name>` by `kill_old=false`) and an abandoned spawn whose pane has died
@@ -59,9 +65,9 @@
   `window_reap_interval_seconds` (1800). (`runtime/telegram-router.py`; coverage in
   `tests/test_window_reaper.py`.)
 
-## Unreleased — session↔topic reconciliation sweep
+### session↔topic reconciliation sweep
 
-### Added
+#### Added
 - **The router now reconciles sessions against forum topics on a ~20m sweep, so the
   two views can't silently drift** (issue #7). Two directions: a registry entry
   whose `claude_pid` is dead (the session exited or the box rebooted) has its forum
@@ -79,9 +85,9 @@
   `reconcile_grace_seconds` (600). (`runtime/telegram-router.py`; coverage in
   `tests/test_reconcile.py`.)
 
-## Unreleased — drain lock-leak fix
+### drain lock-leak fix
 
-### Fixed
+#### Fixed
 - **An empty `telegram-inbox.sh drain` no longer leaks `poll.lock.d`.** `drain`/`ack`
   is a lock handshake: `drain` acquires the per-topic lock, `ack` releases it. The
   bind-time section-A drain runs before any message has arrived, so it found an empty
@@ -96,9 +102,9 @@
   round-trip test. (`runtime/telegram-inbox.sh`; regression coverage in
   `tests/test_inbox_drain.py`.)
 
-## Unreleased — pane-keyed session↔topic resolution (Phase 1)
+### pane-keyed session↔topic resolution (Phase 1)
 
-### Changed
+#### Changed
 - **All three resolvers now share `bridge_resolve`, keyed on the tmux pane.** The
   permission hook, the AskUserQuestion MCP server, and the AskUserQuestion hook
   each carried their own near-identical copy that resolved a session's topic by
@@ -154,7 +160,7 @@
   project name you actually pick a session by; selectors match that label or the
   window index. (`runtime/telegram-router.py` — new `_pane_label`.)
 
-### Added
+#### Added
 - **`/attach all` — bulk-adopt every unattached session.** Binds each candidate in
   one command (loop create-topic + stamp + register + send-keys), reporting the
   roster of topics opened and any that failed. The single and bulk paths now share
@@ -172,7 +178,7 @@
   closed topics. Pure `_topics_to_reap` carries the aging policy.
   (`runtime/telegram-router.py`, `runtime/compaction.json`.)
 
-### Removed
+#### Removed
 - **Clean cutover: the resolver's cwd fallback is gone.** With binding now
   programmatic on every path (spawn for `/new` + rollover, router for `/attach`),
   `bridge_resolve.resolve()` is pane-keyed only — pane option then spawn env, no
@@ -184,7 +190,7 @@
   (`runtime/bridge_resolve.py`, `runtime/telegram-permission-hook.py`,
   `runtime/telegram-auq-mcp.py`, `runtime/telegram-askuserquestion-hook.py`.)
 
-### Fixed
+#### Fixed
 - **`poll_lock_ttl_seconds` / `handoff_lock_ttl_seconds` from `compaction.json` are
   now honored.** `load_compaction_cfg` only carries through keys present in
   `CONFIG_DEFAULTS`, and these two weren't — so the shipped file values were
@@ -204,9 +210,9 @@
   `DEAD`-renamed window each sweep as a backstop against a missed in-session clear.
   (`runtime/poll-prompt.tmpl`, `runtime/telegram-router.py`.)
 
-## Unreleased — router-integrated wedge auto-clear
+### router-integrated wedge auto-clear
 
-### Changed
+#### Changed
 - **Wedge auto-clear folded into the router; watchdog retired.** Detection of a
   session stuck on an interactive menu (a "wedge") now lives in the router's
   `context_loop` instead of a separate `telegram-watchdog.py` daemon + launchd
@@ -217,7 +223,7 @@
   `telegram-watchdog.py`, `com.telegram.watchdog.plist`, and the watchdog control
   subcommands.)
 
-### Fixed
+#### Fixed
 - **Wedge detection is bottom-anchored (no more false positives).** Only the last
   ~12 pane lines are examined, an "Esc to cancel" footer must appear in the last 3
   lines, and the cursor must sit on a numbered option — so a session that merely
@@ -229,9 +235,9 @@
   `claude_pid` is dead, so even between router restarts an orphaned entry can't
   hang a fresh session that shares its cwd. (`telegram-permission-hook.py`.)
 
-## Unreleased — session lifecycle: reaping, /attach, orphan cleanup
+### session lifecycle: reaping, /attach, orphan cleanup
 
-### Added
+#### Added
 - **`/attach` — adopt an existing Claude session.** Lists unattached `claude`
   panes in the shared tmux session and binds one to a topic by sending it
   `/telegram-bridge`, so a session you started by hand becomes phone-reachable
@@ -242,12 +248,12 @@
   ownership. An adopted (user-started) session is detached on `/end`, never
   reaped. (`telegram-router.py`, `telegram-spawn.sh`.)
 
-### Changed
+#### Changed
 - **Daemon commands work from any topic.** `/new`, `/attach`, `/sessions`,
   `/whoami`, `/help` are handled by the router from whatever topic they're typed
   in — every topic doubles as a control channel. (`telegram-router.py`.)
 
-### Fixed
+#### Fixed
 - **Orphaned registry entries no longer gate fresh sessions.** A reboot or crash
   leaves a dead session's registry JSON on disk; because the permission hook
   resolves a bridge session by cwd, a fresh Claude opened in that directory
@@ -255,14 +261,14 @@
   watching, hanging ~28 min. The router now prunes registry entries whose
   `claude_pid` is dead at startup. (`telegram-router.py`.)
 
-## Unreleased — risk-tiered permissions (Tier 2)
+### risk-tiered permissions (Tier 2)
 
 The Tier-2 permission gate now works for real and applies uniformly to **every**
 bridge session. Previously it was effectively dead code: spawns launched with
 `--dangerously-skip-permissions`, under which the hook's decisions never fired, so
 `auto-allow` was the de-facto behavior by accident.
 
-### Added
+#### Added
 - **Risk-tiered permission round-trip (the new default).** Dangerous tool calls —
   `Write`/`Edit`/`NotebookEdit`, **risky** Bash (`rm -rf`, force-push, `kubectl
   delete`, `drop table`, `curl … | sh`, …), and any non-allowlisted `mcp__*` — are
@@ -278,7 +284,7 @@ bridge session. Previously it was effectively dead code: spawns launched with
   wildcard) to `~/.telegram-bridge/spawned-allow.json`, read live by the hook so the
   same call won't ask again. Auditable, editable plain JSON.
 
-### Changed
+#### Changed
 - **Spawns launch with `--permission-mode dontAsk`** instead of
   `--dangerously-skip-permissions`. In dontAsk a tool the hook doesn't allow is
   auto-denied (never a hanging prompt); a hook `allow` runs it; a hook `deny`
@@ -294,7 +300,7 @@ bridge session. Previously it was effectively dead code: spawns launched with
 - **Approval wait raised to ~28 min** (hook `timeout` 30 min) so the owner can be
   away from their phone. (Was 240s.)
 
-### Fixed
+#### Fixed
 - **`claude --settings <file>` silently dropped the user's hooks.** The spawn used
   it to load persisted allow-rules, which disabled the very permission hook. Removed;
   the hook reads `spawned-allow.json` directly instead. (`telegram-spawn.sh`.)
@@ -307,14 +313,14 @@ bridge session. Previously it was effectively dead code: spawns launched with
   a numeric first token) produced rules like `Bash(1680:*)`; the skeleton extractor
   now rejects non-command-shaped tokens and degrades to allow-once.
 
-## Unreleased — review-fix pass (agnostic transport)
+### review-fix pass (agnostic transport)
 
 Implements an outside review's "do-now" set. The throughline: make
 incoming-transmission an **agnostic transport** that injects only
 transport-necessary mechanism, with all operator-style behavior moved behind a
 documented, user-amendable seam (default = normal Claude).
 
-### Added
+#### Added
 - **AskUserQuestion over Telegram (verified end-to-end).** A spawned session asks
   the owner through the `mcp__telegram__AskUserQuestion` MCP server: single-select
   options render as one-tap buttons; multi-select renders a toggle keyboard (tap to
@@ -325,7 +331,7 @@ documented, user-amendable seam (default = normal Claude).
   `auto-allow` still denies the question so an unattended model self-decides.
   (`telegram-auq-mcp.py`, `telegram-router.py`.)
 
-### Fixed
+#### Fixed
 - **Symlinked cwd broke session-topic lookup.** The registry stored a session's cwd
   as the spawn saw it (e.g. `/tmp`) while the MCP server and permission hook resolve
   `os.getcwd()` (e.g. `/private/tmp` on macOS), so the topic match silently failed and
@@ -336,7 +342,7 @@ documented, user-amendable seam (default = normal Claude).
   `runtime/permissions.json` over the deployed copy, clobbering a user-chosen
   `spawned_mode`. Now seeded only when absent, like `dir-aliases.json`.
 
-### Changed
+#### Changed
 - **Smart-router / dumb-session redesign (core).** Moved polling/timing
   intelligence from per-session poll crons into the router daemon. The router now
   (a) **pushes** a one-line drain nudge to the session's pane the moment a message
@@ -375,7 +381,7 @@ documented, user-amendable seam (default = normal Claude).
   now says `[60,120,300,1800]` (= 1m/2m/5m/30m), matching the shipped
   `compaction.json`.
 
-### Added
+#### Added
 - **Configurable lifecycle hooks (C1).** Four per-event hook files in
   `~/.telegram-bridge/lifecycle/` — `style` (reply formatting, every attach),
   `start` (restore on a spawned/rollover birth), `save` (persist on rollover), `end`
@@ -394,7 +400,7 @@ documented, user-amendable seam (default = normal Claude).
 - **README "Philosophy: transport, not workflow opinion" and "Customizing agent
   behavior" sections (H4)**, plus a "Known issues" section.
 
-### Fixed
+#### Fixed
 - **`/new` spawns now wire in the AskUserQuestion MCP (#1).** `telegram-spawn.sh`
   passes `--mcp-config <auq config>` to the spawned `claude` when the rendered
   config exists, so an unattended spawn that has native AUQ disabled gets the
@@ -406,7 +412,7 @@ documented, user-amendable seam (default = normal Claude).
   collected in one `CLAUDE_FLAGS` array shared by both tmux branches instead of
   being duplicated.
 
-### Security
+#### Security
 - **Plist token hardening (C3).** `telegram-bridge start` / `watchdog-start` now
   `chmod 600` the rendered launchd plists right after the sed render (they contain
   the bot token in plaintext; LaunchAgents default to 644). Security notes mention
@@ -418,7 +424,7 @@ documented, user-amendable seam (default = normal Claude).
 - **Executable bits on install (M4).** `install.sh` now `chmod +x` all installed
   `runtime/*.sh` and `runtime/*.py`.
 
-### Documented (deferred — pending the first end-to-end test, not blind-rewritten)
+#### Documented (deferred — pending the first end-to-end test, not blind-rewritten)
 - **AskUserQuestion mechanisms (H1).** The MCP server + button taps is the
   supported path (verified to work with what the router writes). Two alternates are
   flagged as unverified in README "Known issues": typed (non-button) MCP answers
@@ -431,13 +437,13 @@ documented, user-amendable seam (default = normal Claude).
   honestly that the default is fully autonomous with no approval round-trip, with a
   bold warning at the `/new` enablement step; flagged as a pending decision.
 
-## Initial scaffold
+### Initial scaffold
 
 Greenfield extraction of a personal Telegram↔Claude Code bridge into a
 standalone, open-sourceable repo under the megadoomer brand. The live personal
 system is untouched; this is a parallel copy.
 
-### Added
+#### Added
 - Runtime copied verbatim from the proven system (router, send, spawn, context
   gauge, watchdog, permission hook, AskUserQuestion MCP + hook, poll loop).
 - macOS `install.sh` that lays out `~/.telegram-bridge`, the control CLI, and
@@ -450,7 +456,7 @@ system is untouched; this is a parallel copy.
 - "Decoupling from gstack" doc: the exact save/restore touchpoints a vanilla
   install adjusts.
 
-### Not yet done (test-gated for next week)
+#### Not yet done (test-gated for next week)
 - End-to-end install + run on a clean setup (nothing here has been executed).
 - Config-driven `context_skill` knob to make gstack save/restore fully optional
   at runtime (today it's a documented manual edit).
