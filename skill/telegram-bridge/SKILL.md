@@ -1,7 +1,7 @@
 ---
 name: telegram-bridge
 description: Open a Telegram forum topic bound to this Claude session — messages typed there route to this live session, which replies in-topic with full context.
-version: 1.10.0
+version: 1.11.0
 ---
 
 # /telegram
@@ -295,6 +295,8 @@ acts. (`reap_stale_windows` + the pure `_windows_to_reap`.)
 | `window_reaper_enabled` | `false` | Opt-in: kill confirmed-dead bridge windows (`DEAD - *` + dead-pane `tg-*`) in the shared tmux session. Off by default — `kill-window` is irreversible |
 | `window_reap_grace_seconds` | `3600` | How long a dead window must persist before the reaper kills it (lets you inspect its scrollback first) |
 | `window_reap_interval_seconds` | `1800` | How often the window reaper sweeps |
+| `mcp_hang_recovery_enabled` | `false` | Opt-in (issue #18, owner-deferred): auto-clear a BUSY session hung on an MCP tool call that never returns. Gated to MCP tools (name starts `mcp__`) so a long Bash/native tool is never cut; then requires undrained inbox + outstanding `tool_use` (no result) + no transcript progress for the dwell, and skips a pending permission/AskUserQuestion. Recovery sends Esc (cancel only). Off by default |
+| `mcp_hang_dwell_seconds` | `300` | How long the hung-tool signature must persist before Esc (fixed 300s default) |
 | `kill_old` | `false` | After handoff, `false` renames the old tmux window `DEAD - <name>` and clears its pane's `@telegram_thread_id` binding (the window reaper above can then collect it if enabled); `true` kills the window outright |
 
 Trigger it manually with `/compact` from the topic; check the gauge any time with
@@ -333,6 +335,41 @@ Per bridged topic, each sweep:
 Signatures matched: `Do you want to proceed?`, `Do you want to make this edit`,
 `Do you want to create`, `Do you trust the files`, `Enter passphrase`, and the
 generic Claude selection menu (`❯ 1.` choice line plus the `Esc to cancel` footer).
+
+### Hung-MCP-tool recovery (opt-in, default off)
+
+The wedge sweep above only catches a session blocked on a *native prompt* it can
+read off the pane tail. A different failure mode it can't see: a **BUSY** session
+hung on an **MCP tool call that never returns** — e.g. a Gmail MCP wanting headless
+OAuth, or a server that just stalls. There's no `Esc to cancel` footer, so the
+wedge signatures don't match; and the session is busy (not idle), so the
+push/backstop can't reach it either. Nothing self-heals it — today you recover it
+by sending Esc to the pane yourself.
+
+This **opt-in** sweep (`mcp_hang_recovery_enabled`, **default off**) automates that
+recovery. It is off by default because **issue #18 is owner-deferred** — turn it on
+deliberately. Detection is **gated to MCP tool calls**: the outstanding `tool_use`
+name must start with `mcp__`. A long `Bash` / `WebFetch` / native tool legitimately
+runs with no transcript progress and an outstanding `tool_use` the whole time, so
+gating on MCP is what spares a healthy long task — a bare wall-clock gate would cut
+it. Given an outstanding MCP call, it then requires:
+- an **undrained inbox** (something is actually waiting on this session), AND
+- the transcript's **last `tool_use` has no matching `tool_result`** (the MCP call
+  is genuinely outstanding), AND
+- **no transcript progress** — no new assistant turn or `tool_result` — for
+  `mcp_hang_dwell_seconds` (a fixed 300s default). A `queue-operation` append
+  (queued input bumping the file mtime) is explicitly **not** progress; the gate
+  reads transcript content, not mtime. A new outstanding tool, or any progress,
+  re-arms a clean episode. It also skips a topic with a permission OR
+  AskUserQuestion already pending (`perm-pending.json` / `auq-pending.json`) — those
+  are supported outstanding calls blocking on the owner, not hangs.
+
+On a ripe hang it does exactly what the native-prompt sweep does: sends **`Escape`**
+(which can only *cancel* the call, never approve anything), injects a trusted inbox
+note explaining the call was cancelled and to retry / ask in the topic, nudges a
+drain, and posts a `🪤` alert. Episode state is in-memory, so a router restart
+re-arms cleanly. (Pure scan `_scan_outstanding_tool` + pure policy `detect_hung_tool`;
+impure shell `handle_hung_tool` in `telegram-router.py`.)
 
 ## Setup commands (typed in the control group, handled by the daemon)
 
