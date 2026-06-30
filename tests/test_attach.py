@@ -63,7 +63,7 @@ LIST_SAMPLE = "\n".join([
     "%3\t1\tzsh\tclaude\t/Users/x/src/megadoomer-io/incoming-transmission",  # adopt
     "%29\t2\tzsh\tclaude\t/Users/x/src/missionlane/joey",                    # adopt
     "%4\t3\tbash\tbash\t/Users/x/other",        # not claude -> skip
-    "%5\t4\ttg:work\tclaude\t/Users/x/work",    # bridge window -> skip
+    "%5\t4\ttg-work\tclaude\t/Users/x/work",    # bridge window -> skip
     "%6\t5\tDEAD - old\tclaude\t/Users/x/old",  # retired window -> skip
     "malformed-line-no-tabs",                   # ignored
 ])

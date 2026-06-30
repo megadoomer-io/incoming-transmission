@@ -47,17 +47,26 @@ def test_dead_window_within_grace_kept():
 
 def test_tg_dead_pane_past_grace_reaped():
     mod = _load_router()
-    windows = [("@2", "tg:portal", True)]         # claude exited -> dead pane
+    windows = [("@2", "tg-portal", True)]         # claude exited -> dead pane
     reap, _ = mod._windows_to_reap(windows, {"@2": 0}, now_mono=10_000, grace_seconds=3600)
     assert reap == ["@2"]
 
 
 def test_tg_live_pane_never_reaped():
     mod = _load_router()
-    windows = [("@2", "tg:portal", False)]        # claude still running
+    windows = [("@2", "tg-portal", False)]        # claude still running
     reap, seen_next = mod._windows_to_reap(windows, {"@2": 0}, now_mono=10_000, grace_seconds=3600)
     assert reap == []
     assert seen_next == {}                         # non-corpse dropped -> re-arms
+
+
+def test_legacy_tg_colon_prefix_still_reaped():
+    mod = _load_router()
+    # Windows spawned before the tmux-3.7 colon rename carry the legacy "tg:" name.
+    # The corpse check matches both prefixes so those old windows are still collected.
+    windows = [("@7", "tg:legacy", True)]         # dead pane, legacy colon prefix
+    reap, _ = mod._windows_to_reap(windows, {"@7": 0}, now_mono=10_000, grace_seconds=3600)
+    assert reap == ["@7"]
 
 
 def test_user_window_never_reaped():
