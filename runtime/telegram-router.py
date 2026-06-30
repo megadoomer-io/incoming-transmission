@@ -962,6 +962,27 @@ def clear_stale_pane_options():
         log("backstop: cleared stale @telegram_thread_id on DEAD pane {}".format(pane_id))
 
 
+def _pane_bound_to_thread(list_panes_output, pane_id, tkey):
+    """Pure: given `list-panes -F "#{pane_id}\\t#{@telegram_thread_id}"` output,
+    is `pane_id` still present AND still bound to thread `tkey`? Used to infer the
+    liveness of a registry entry whose claude_pid is None (mid-bind / rollover /
+    pre-pid format) from the AUTHORITATIVE, DURABLE pane option rather than treating
+    it as immortally alive. Returns False if the pane is gone (its session died) or
+    carries a different/absent binding (it was re-bound or its option was cleared).
+    The option value is a numeric thread id and pane_id has no tab, so a 2-field
+    tab split is safe; an unset option yields an empty second field (-> unbound)."""
+    if not pane_id:
+        return False
+    for line in list_panes_output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        pid, opt = parts
+        if pid == pane_id:
+            return opt == str(tkey)
+    return False
+
+
 def _windows_to_reap(windows, seen, now_mono, grace_seconds):
     """Pure window-reaper policy (issue #6). Decide which shared-session tmux windows
     are confirmed-dead bridge corpses ripe for killing.
@@ -1655,20 +1676,57 @@ def reconcile_sessions_topics(chat_id):
                 continue
             if reg.get("thread_id") is not None:
                 registry[f.stem] = reg
+    cfg = load_compaction_cfg()
+    grace = max(60, int(cfg.get("reconcile_grace_seconds", 600) or 600))
+    now = int(time.time())
+    # One list-panes per sweep, reused for every null-pid entry's pane inference.
+    _panes_out = None
     entries = []
     for tkey, reg in registry.items():
         cpid = reg.get("claude_pid")
         # Mid-handoff (compacting.lock present) counts as alive: a rollover briefly
         # has a dead old pid before the replacement re-registers — don't close it.
         handoff = (INBOX_ROOT / tkey / "compacting.lock").exists()
-        # claude_pid None => can't assess => treat as alive (matches
-        # prune_orphaned_registry: pre-pid-format entries are left alone).
-        alive = cpid is None or _pid_alive(cpid) or handoff
+        if cpid is not None:
+            alive = _pid_alive(cpid) or handoff
+        else:
+            # claude_pid None: instead of treating it as immortally alive (which
+            # would let a dead session's topic sink phone messages into a /tmp inbox
+            # forever), infer liveness from the bound tmux pane — the AUTHORITATIVE
+            # @telegram_thread_id binding. A pane that's still present AND still bound
+            # to this thread is alive; a gone/re-bound pane past the grace window is a
+            # dead session -> close + drop. Within grace, or with NO pane_id to assess
+            # (truly unassessable / pre-pane format), leave it alone (backward compat).
+            pane_id = reg.get("pane_id")
+            if pane_id and not handoff:
+                if _panes_out is None:
+                    # Cross-session ("-a"), NOT scoped to TMUX_SESSION: a keyboard
+                    # `/telegram` self-bind (bridge_bind._self_bind_main) binds
+                    # $TMUX_PANE in WHATEVER tmux session the user is in, often not
+                    # the shared "claude" one, and can store claude_pid=None when its
+                    # pid capture fails. A session-scoped probe would miss that live
+                    # foreign-session pane, fall through to the mtime grace, and wrongly
+                    # close its topic. Matching is by exact pane_id + binding, so "-a"
+                    # adds no false positives. (The session-scoped list-panes probes
+                    # elsewhere are deliberate — they only operate on bridge-managed
+                    # windows in the shared session.)
+                    _panes_out = _tmux("list-panes", "-a",
+                                       "-F", "#{pane_id}\t#{@telegram_thread_id}")
+                bound = _pane_bound_to_thread(_panes_out, pane_id, tkey)
+                if bound:
+                    alive = True
+                else:
+                    try:
+                        age = now - (REGISTRY_DIR / "{}.json".format(tkey)).stat().st_mtime
+                    except OSError:
+                        age = 0
+                    alive = age < grace      # within grace (or unmeasurable) -> keep
+            else:
+                # No pane_id (unassessable / pre-pane) or mid-handoff -> treat as alive.
+                alive = True
         entries.append((tkey, int(reg["thread_id"]), alive))
     ledger = load_ledger()
-    cfg = load_compaction_cfg()
-    grace = max(60, int(cfg.get("reconcile_grace_seconds", 600) or 600))
-    close, drop = _reconcile_plan(entries, ledger, int(time.time()), grace)
+    close, drop = _reconcile_plan(entries, ledger, now, grace)
     if not close and not drop:
         return
     changed = False
