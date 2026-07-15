@@ -1267,8 +1267,19 @@ def detect_wedge(text):
     # Claude Code choice menu (permission / AskUserQuestion / /model / trust-folder):
     # the cursor ❯ on a numbered option (ANY number — Claude Code points it at the
     # CURRENTLY-SELECTED option, e.g. `❯ 7.` in /model, not always `❯ 1.`) AND an
-    # "Esc to cancel" footer in the last few lines, where a live prompt renders it.
-    if re.search(r"esc to cancel", last3, re.I) and re.search(r"❯\s*\d+\.", "\n".join(tail)):
+    # "Esc to cancel" footer at the very end, where a live prompt renders it.
+    #
+    # The footer stays anchored to last3 — that is the anti-false-positive guard
+    # (a session merely DISPLAYING "Esc to cancel" as scrollback content rarely
+    # ends on exactly that line). But the ❯-cursor line is searched over a WIDER
+    # window: a rich AskUserQuestion renders a tall side-preview box beside the
+    # options (e.g. /plan-eng-review's multi-line rationale panel), pushing the
+    # cursor well above the footer. With a 12-line window the cursor fell just
+    # outside and the wedge went undetected — the exact miss that stranded a
+    # phone-driven session on a native menu. 28 lines spans a tall preview while
+    # the footer anchor keeps false positives out.
+    cursor_scan = "\n".join(lines[-28:])
+    if re.search(r"esc to cancel", last3, re.I) and re.search(r"❯\s*\d+\.", cursor_scan):
         return "selection-prompt"
     return None
 
