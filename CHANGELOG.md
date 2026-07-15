@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### fix: wedge auto-clear missed AskUserQuestion menus with a tall preview box
+
+#### Fixed
+- **A native selection prompt with a tall side-preview box (e.g. `/plan-eng-review`'s
+  multi-line rationale panel) was not detected as a wedge, so the auto-clear never
+  fired and a phone-driven session sat stranded on the menu.** `detect_wedge`
+  searched for the `❯ N.` cursor only in the last 12 non-empty lines of the pane;
+  the preview box pushes the cursor line more than 12 lines above the "Esc to cancel"
+  footer, so the cursor check missed and the signature returned "not a wedge" every
+  sweep. The footer stays anchored to the last 3 lines (the anti-false-positive
+  guard), but the cursor is now searched over a wider 28-line window so a tall
+  preview still matches (`runtime/telegram-router.py`). First test coverage for
+  `detect_wedge` added, including the tall-preview regression and the
+  footer-in-scrollback false-positive guard (`tests/test_detect_wedge.py`).
+
 ## v1.0.0 — 2026-06-30
 
 First tagged release of the Telegram bridge ("incoming-transmission"). Everything
