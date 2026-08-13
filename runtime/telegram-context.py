@@ -11,10 +11,19 @@
 #
 # Context occupancy ~= the latest assistant turn's input side:
 #   input_tokens + cache_read_input_tokens + cache_creation_input_tokens
-# output_tokens is not resident context, so it is excluded. Window is 1,000,000
-# for the Opus 1m variant (model id contains "[1m]"), else 200,000 — with a
-# safety fallback to 1m when the observed token count already exceeds 200k (a
-# session whose model id was recorded without the [1m] suffix).
+# output_tokens is not resident context, so it is excluded.
+#
+# Window sizing: the model id used to carry the tier as a "[1m]" suffix, but a
+# Claude Code update (2026-08-12) dropped it — the bridged session now records
+# "claude-opus-4-8" with no tier marker, so the id alone can no longer tell 1m
+# from 200k. Opus 4.8 as this bridge runs it IS the 1m variant, so treat any
+# opus-4-8 id (suffixed or not) as wide. The tokens>200k safety fallback still
+# catches any other model silently on a wide window. Without this fix a session
+# below 200k on a real 1m window was sized against 200k, inflating pct up to ~5x
+# and tripping auto-compaction almost immediately.
+#   Downside if the policy is ever wrong (a genuinely-200k opus-4-8): the window
+#   is over-sized, so compaction fires late instead of early. Preferable to
+#   today's thrash, and overridable by editing WIDE_MODELS.
 #
 # Writes /tmp/claude-telegram/sessions/<thread>/status.json:
 #   {"pct":0.37,"tokens":372000,"window":1000000,"msgs":42,
@@ -37,6 +46,11 @@ from pathlib import Path
 DEFAULT_WINDOW = 200_000
 WIDE_WINDOW = 1_000_000
 SESSIONS_ROOT = Path("/tmp/claude-telegram/sessions")
+
+# Model-id substrings that mean a 1,000,000-token window. Matched case-insensitively
+# against the recorded model id. The tier is no longer in the id (see module
+# docstring), so this is a name-based allowlist, not a suffix check.
+WIDE_MODELS = ("opus-4-8",)
 
 
 def compute(transcript_path):
@@ -71,7 +85,12 @@ def compute(transcript_path):
     if tokens == 0:
         return None
 
-    wide = "[1m]" in (model or "") or tokens > DEFAULT_WINDOW
+    mid = (model or "").lower()
+    wide = (
+        "[1m]" in mid
+        or any(w in mid for w in WIDE_MODELS)
+        or tokens > DEFAULT_WINDOW
+    )
     window = WIDE_WINDOW if wide else DEFAULT_WINDOW
     return {
         "pct": round(tokens / window, 4),
