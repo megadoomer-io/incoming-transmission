@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 — 2026-08-12
 
 ### fix: context gauge sized 1m sessions against the 200k window after Claude Code dropped the "[1m]" model-id suffix
 
