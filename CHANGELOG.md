@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### fix: context gauge sized 1m sessions against the 200k window after Claude Code dropped the "[1m]" model-id suffix
+
+#### Fixed
+- **A Claude Code update (2026-08-12) removed the `[1m]` tier suffix from the recorded
+  model id, so bridged sessions now log `claude-opus-4-8` with no tier marker.** The
+  context gauge keyed the window on the `[1m]` substring, so a session below 200k
+  tokens on a real 1,000,000-token window was sized against the 200k default —
+  inflating the reported context percentage up to ~5x and tripping router
+  auto-compaction (`trigger_pct` 0.85) at roughly 17% real usage, so sessions rolled
+  over almost immediately. The window is now detected by a model-id allowlist
+  (`WIDE_MODELS`, currently `opus-4-8`) instead of the vanished suffix, keeping the
+  legacy `[1m]` check and the `tokens > 200k` safety fallback
+  (`runtime/telegram-context.py`). First test coverage for the context gauge added
+  (`tests/test_context.py`).
+
 ### fix: wedge auto-clear missed AskUserQuestion menus with a tall preview box
 
 #### Fixed
