@@ -102,3 +102,37 @@ def test_no_usage_returns_none(tmp_path):
     p = tmp_path / "empty.jsonl"
     p.write_text("")
     assert ctx.compute(p) is None
+
+
+# Claude 5 family: opus-5-x and fable-5-x run a 1m window too (transcripts seen
+# at 416k / 261k), but the allowlist only knew opus-4-8, so they were sized at
+# 200k and rolled over at ~170k.
+def test_opus_5_is_wide(tmp_path):
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 170_000)])
+    data = ctx.compute(p)
+    assert data["window"] == ctx.WIDE_WINDOW
+
+
+def test_fable_5_is_wide(tmp_path):
+    p = _write_transcript(tmp_path, [("claude-fable-5-1", 170_000)])
+    data = ctx.compute(p)
+    assert data["window"] == ctx.WIDE_WINDOW
+
+
+def test_model_windows_config_overrides_guess(tmp_path, monkeypatch):
+    cfg = tmp_path / "compaction.json"
+    cfg.write_text(json.dumps({"model_windows": {"opus-5-5": 500_000}}))
+    monkeypatch.setattr(ctx, "CONFIG_FILE", cfg)
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    data = ctx.compute(p)
+    assert data["window"] == 500_000
+    assert data["pct"] == round(100_000 / 500_000, 4)
+
+
+def test_bad_config_falls_back_to_guess(tmp_path, monkeypatch):
+    cfg = tmp_path / "compaction.json"
+    cfg.write_text("{not json")
+    monkeypatch.setattr(ctx, "CONFIG_FILE", cfg)
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    data = ctx.compute(p)
+    assert data["window"] == ctx.WIDE_WINDOW
