@@ -25,6 +25,12 @@
 #   is over-sized, so compaction fires late instead of early. Preferable to
 #   today's thrash, and overridable by editing WIDE_MODELS.
 #
+# 2026-10-19: opus-5-x and fable-5-x also run wide (transcripts show opus-5-5
+# at 416k and fable-5 at 261k), but WIDE_MODELS only knew opus-4-8, so every
+# 5-family session was sized at 200k and rolled over at ~170k. Added them, plus
+# a "model_windows" map in compaction.json ({"<id substring>": <tokens>}) that
+# wins over the built-in guess, so a new model never needs a code edit.
+#
 # Writes /tmp/claude-telegram/sessions/<thread>/status.json:
 #   {"pct":0.37,"tokens":372000,"window":1000000,"msgs":42,
 #    "model":"claude-opus-4-8[1m]","updated":"2026-06-18T21:00:00Z"}
@@ -50,7 +56,20 @@ SESSIONS_ROOT = Path("/tmp/claude-telegram/sessions")
 # Model-id substrings that mean a 1,000,000-token window. Matched case-insensitively
 # against the recorded model id. The tier is no longer in the id (see module
 # docstring), so this is a name-based allowlist, not a suffix check.
-WIDE_MODELS = ("opus-4-8",)
+WIDE_MODELS = ("opus-4-8", "opus-5", "fable-5")
+CONFIG_FILE = Path(__file__).resolve().parent / "compaction.json"
+
+
+def configured_window(mid):
+    """Window from compaction.json's model_windows map, or None if unset/unmatched."""
+    try:
+        windows = json.loads(CONFIG_FILE.read_text()).get("model_windows") or {}
+    except (OSError, ValueError):
+        return None
+    for sub, size in windows.items():
+        if sub.lower() in mid and isinstance(size, int) and size > 0:
+            return size
+    return None
 
 
 def compute(transcript_path):
@@ -91,7 +110,7 @@ def compute(transcript_path):
         or any(w in mid for w in WIDE_MODELS)
         or tokens > DEFAULT_WINDOW
     )
-    window = WIDE_WINDOW if wide else DEFAULT_WINDOW
+    window = configured_window(mid) or (WIDE_WINDOW if wide else DEFAULT_WINDOW)
     return {
         "pct": round(tokens / window, 4),
         "tokens": tokens,
