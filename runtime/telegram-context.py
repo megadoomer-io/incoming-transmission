@@ -24,6 +24,10 @@
 #   Downside if the policy is ever wrong (a genuinely-200k opus-4-8): the window
 #   is over-sized, so compaction fires late instead of early. Preferable to
 #   today's thrash, and overridable by editing WIDE_MODELS.
+# The allowlist has to track model renames: the Opus 5 family ("claude-opus-5-5")
+# was missed until 2026-10-21, so it was sized against 200k and compacted at ~17%
+# real usage, the same bug again. Observed opus-5-5 transcripts reach ~940k tokens,
+# which confirms the 1m window.
 #
 # Writes /tmp/claude-telegram/sessions/<thread>/status.json:
 #   {"pct":0.37,"tokens":372000,"window":1000000,"msgs":42,
@@ -50,7 +54,7 @@ SESSIONS_ROOT = Path("/tmp/claude-telegram/sessions")
 # Model-id substrings that mean a 1,000,000-token window. Matched case-insensitively
 # against the recorded model id. The tier is no longer in the id (see module
 # docstring), so this is a name-based allowlist, not a suffix check.
-WIDE_MODELS = ("opus-4-8",)
+WIDE_MODELS = ("opus-4-8", "opus-5")
 
 
 def compute(transcript_path):

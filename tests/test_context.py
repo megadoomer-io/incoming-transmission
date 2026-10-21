@@ -68,6 +68,15 @@ def test_opus_4_8_with_legacy_1m_suffix_still_wide(tmp_path):
     assert data["window"] == ctx.WIDE_WINDOW
 
 
+def test_opus_5_family_is_wide(tmp_path):
+    # Regression: claude-opus-5-5 was missing from WIDE_MODELS, so a session at
+    # 141k on a real 1m window reported 71% and compacted at ~170k.
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 141_349)])
+    data = ctx.compute(p)
+    assert data["window"] == ctx.WIDE_WINDOW
+    assert data["pct"] == round(141_349 / 1_000_000, 4)
+
+
 def test_matching_is_case_insensitive(tmp_path):
     p = _write_transcript(tmp_path, [("Claude-Opus-4-8", 50_000)])
     data = ctx.compute(p)
