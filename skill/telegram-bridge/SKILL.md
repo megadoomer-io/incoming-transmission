@@ -214,7 +214,8 @@ fixed interval (`context_interval_seconds`, default 90s), writes `status.json`, 
 the main loop edits the pin. This runs OFF the getUpdates path, so a large
 transcript scan can't stall message routing. The session no longer touches
 `status.json`. Window detection is automatic and by model id: an id on the
-1m-window allowlist (`WIDE_MODELS` in `telegram-context.py`, currently `opus-4-8`)
+1m-window allowlist (`WIDE_MODELS` in `telegram-context.py`, currently `opus-4-8`
+and `opus-5`)
 gets a 1,000,000-token window, everything else 200,000, with a fallback to 1m if
 observed tokens already exceed 200k. The allowlist replaced a `[1m]`-suffix check
 after a Claude Code update (2026-08-12) dropped that suffix from recorded model
