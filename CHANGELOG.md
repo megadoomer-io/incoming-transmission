@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### fix: context gauge sized Opus 5 sessions against the 200k window
+
+#### Fixed
+- **`WIDE_MODELS` only listed `opus-4-8`, so sessions on `claude-opus-5-5` (a 1m
+  window) were sized against the 200k default.** A session at 141k tokens reported
+  71%, and router auto-compaction (`trigger_pct` 0.85) fired at about 170k tokens
+  instead of 850k. `opus-5` is now on the allowlist (`runtime/telegram-context.py`),
+  with a regression test (`tests/test_context.py`). The allowlist still breaks on
+  the next model rename; sizing from the window Claude Code itself reports is tracked
+  as a follow-up.
+
 ## v1.1.0 — 2026-08-12
 
 ### fix: context gauge sized 1m sessions against the 200k window after Claude Code dropped the "[1m]" model-id suffix
