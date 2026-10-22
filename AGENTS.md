@@ -31,10 +31,14 @@ every bridged session. When a human is talking to you, behave like normal Claude
 ## Releases and CHANGELOG
 
 `CHANGELOG.md` is written by release-please
-(`.github/workflows/release-please.yml`), not by hand. Use conventional commit
-subjects (`fix(scope):`, `feat(scope):`). Those commits become the entries in an open
-`chore(release): cut vX.Y.Z` PR. Fork PRs merged with a merge commit still count,
-because release-please reads the PR's own commits. Don't add `## Unreleased`
+(`.github/workflows/release-please.yml`), not by hand. Conventional commits on main
+(`fix(scope):`, `feat(scope):`) become the entries in an open
+`chore(release): cut vX.Y.Z` PR.
+
+Squash-merge PRs, fork PRs included. The repo uses the PR title as the squash subject
+and leaves the body blank, so each PR gives exactly one entry and the PR title has to
+be conventional. A merge commit's body repeats the PR title, so release-please lists
+the fix twice (once for the merge commit, once for the original commit). Don't add `## Unreleased`
 sections in feature PRs. To give a fix a longer explanation, edit the CHANGELOG diff
 on the release PR before merging it. Merging the release PR tags `vX.Y.Z` and
 publishes the GitHub release.
