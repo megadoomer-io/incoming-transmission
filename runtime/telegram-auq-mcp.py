@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["mcp>=1.2.0"]
+# dependencies = ["mcp>=1.2.0,<2"]  # 2.x renamed FastMCP (2026-10)
 # ///
 # ----------------------------------------------------------------------------
 # "THE BEER-WARE LICENSE" (Revision 42):
