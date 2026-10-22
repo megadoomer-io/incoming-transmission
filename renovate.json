@@ -1,6 +1,54 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "mergeConfidence:all-badges"
+  ],
+  "semanticCommits": "enabled",
+  "addLabels": [
+    "{{datasource}}-datasrc",
+    "{{manager}}-mgr"
+  ],
+  "packageRules": [
+    {
+      "matchCategories": [
+        "python"
+      ],
+      "minimumReleaseAge": "3 days",
+      "semanticCommitScope": "{{depNameSanitized}}"
+    },
+    {
+      "matchDatasources": [
+        "pypi"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": "python-major",
+      "additionalBranchPrefix": "{{depNameSanitized}}-{{updateType}}",
+      "minimumReleaseAge": "7 days",
+      "semanticCommitScope": "{{depNameSanitized}}-{{updateType}}"
+    },
+    {
+      "description": "mcp 2.x removed mcp.server.fastmcp; held below 2 until telegram-auq-mcp.py is ported to MCPServer",
+      "matchPackageNames": [
+        "mcp"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github-actions",
+      "addLabels": [
+        "gha"
+      ],
+      "minimumReleaseAge": "14 days"
+    }
   ]
 }
