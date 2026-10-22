@@ -441,6 +441,20 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
             params["reply_to_message_id"] = reply_to
         try:
             last = api_call("sendMessage", params)
+        except urllib.error.HTTPError as e:
+            # A stale or cross-thread reply target makes Telegram 400 with
+            # "message to be replied not found", which would otherwise drop the
+            # whole message (status/replies). Retry once without the reply link.
+            if e.code == 400 and "reply_to_message_id" in params:
+                params.pop("reply_to_message_id", None)
+                try:
+                    last = api_call("sendMessage", params)
+                except (urllib.error.URLError, OSError) as e2:
+                    log("ERROR sendMessage (no-reply retry): {}".format(e2))
+                    return None
+            else:
+                log("ERROR sendMessage: {}".format(e))
+                return None
         except (urllib.error.URLError, OSError) as e:
             log("ERROR sendMessage: {}".format(e))
             return None
