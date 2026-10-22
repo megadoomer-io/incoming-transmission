@@ -27,3 +27,14 @@ it in two modes:
 The bridge is an agnostic transport (see Philosophy). The "unattended" wording in
 the prompts describes a transport constraint of case (a), not a blanket posture for
 every bridged session. When a human is talking to you, behave like normal Claude.
+
+## Releases and CHANGELOG
+
+`CHANGELOG.md` is written by release-please
+(`.github/workflows/release-please.yml`), not by hand. Use conventional commit
+subjects (`fix(scope):`, `feat(scope):`). Those commits become the entries in an open
+`chore(release): cut vX.Y.Z` PR. Fork PRs merged with a merge commit still count,
+because release-please reads the PR's own commits. Don't add `## Unreleased`
+sections in feature PRs. To give a fix a longer explanation, edit the CHANGELOG diff
+on the release PR before merging it. Merging the release PR tags `vX.Y.Z` and
+publishes the GitHub release.
