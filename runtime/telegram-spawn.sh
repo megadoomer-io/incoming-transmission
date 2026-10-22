@@ -148,6 +148,38 @@ fi
 SHARED="claude"
 win="tg-$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
+# A brand-new project directory carries no permission grants of its own, so a
+# spawned session comes up able to TALK but unable to DO: it can read the repo
+# and answer on its thread, but cannot start a dev server, typecheck, or test a
+# line it just wrote. The first phone-spawned project on the originating
+# install hit exactly that -- it understood the task, wrote the reply, and was
+# blocked from running the command to send it, explaining itself to a terminal
+# nobody reads.
+#
+# Seed a minimal grant set at spawn time so it is in place BEFORE the session
+# comes up, rather than discovered when it is already stuck.
+#
+# CREATED, never overwritten: a project that already carries its own settings
+# keeps them untouched.
+proj_settings="$dir/.claude/settings.local.json"
+if [[ ! -e "$proj_settings" ]]; then
+    mkdir -p "$dir/.claude"
+    cat > "$proj_settings" <<'PROJPERM'
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "LS",
+      "Bash"
+    ]
+  }
+}
+PROJPERM
+    echo "telegram-spawn: seeded $proj_settings (new project carried no grants)" >&2
+fi
+
 # The new session self-attaches: /telegram creates its own topic (named from the
 # cwd/branch) and loads the bridge procedure (no cron — the router drives timing).
 # TELEGRAM_BRIDGE_SPAWNED=1 marks this as a /new spawn. NOTE: it is NOT what
