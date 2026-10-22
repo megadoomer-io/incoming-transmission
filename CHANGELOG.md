@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.1](https://github.com/megadoomer-io/incoming-transmission/compare/v1.1.0...v1.1.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **auq:** pin mcp&lt;2 so the AskUserQuestion server still starts ([3d207e7](https://github.com/megadoomer-io/incoming-transmission/commit/3d207e700d1162ea7b3079c5ed677f3d782bb285))
+* **auq:** pin mcp&lt;2 so the AskUserQuestion server still starts ([c665710](https://github.com/megadoomer-io/incoming-transmission/commit/c66571000baf4e32f522aea15573714c4ccd920e))
+* **context:** size opus-5 models as 1m window ([#42](https://github.com/megadoomer-io/incoming-transmission/issues/42)) ([1ef7001](https://github.com/megadoomer-io/incoming-transmission/commit/1ef700132bcd24794e3c53f499649f3e337ae94b))
+* **router:** retry sendMessage without reply link on 400 reply-not-found ([9ac74c6](https://github.com/megadoomer-io/incoming-transmission/commit/9ac74c606eb3f88362aa7fc499fecad0d0839405))
+* **router:** retry sendMessage without reply link on 400 reply-not-found ([bf65251](https://github.com/megadoomer-io/incoming-transmission/commit/bf6525118949966e72a62d47a27911031d885ced))
+
 ## v1.1.0 — 2026-08-12
 
 ### fix: context gauge sized 1m sessions against the 200k window after Claude Code dropped the "[1m]" model-id suffix
