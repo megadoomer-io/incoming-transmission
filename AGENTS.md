@@ -42,3 +42,8 @@ the fix twice (once for the merge commit, once for the original commit). Don't a
 sections in feature PRs. To give a fix a longer explanation, edit the CHANGELOG diff
 on the release PR before merging it. Merging the release PR tags `vX.Y.Z` and
 publishes the GitHub release.
+
+The workflow authenticates with the `RELEASE_PLEASE_TOKEN` secret, a fine-grained PAT
+scoped to this repo (Contents, Pull requests: read/write), so the release PR triggers
+`test.yml`. Without the secret it falls back to `GITHUB_TOKEN`; release PRs still open
+but show no `test` check. If release PRs stop showing `test`, the PAT has likely expired.

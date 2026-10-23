@@ -19,3 +19,5 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          # A PAT so the release PR triggers test.yml; GITHUB_TOKEN events don't start workflows.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
