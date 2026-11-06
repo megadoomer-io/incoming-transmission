@@ -74,7 +74,7 @@ def configured_window(mid):
         return None
     # bool is an int subclass: reject true/false so they can't become the window.
     matches = [k for k, size in windows.items()
-               if isinstance(k, str) and k.lower() in mid
+               if isinstance(k, str) and k and k.lower() in mid
                and type(size) is int and size > 0]
     return windows[max(matches, key=len)] if matches else None
 
