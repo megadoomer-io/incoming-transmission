@@ -54,12 +54,20 @@ def record_sent(message_id):
         pass
 
 
+# The calling session is usually blocked on this script, and Claude Code's default
+# Bash timeout is 2 minutes, so the whole send (every chunk) gets one deadline and a
+# long flood-control wait gives up instead of sleeping.
+DEADLINE = time.monotonic() + 100
+MAX_RETRY_AFTER = 30
+
+
 def send(req, attempts=3):
     """POST with retry on transient failures. A timeout after Telegram accepted
     the message can rarely duplicate it; a dropped reply is the worse outcome."""
     for n in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            timeout = max(1, min(20, DEADLINE - time.monotonic()))
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.load(r)
         except urllib.error.HTTPError as e:
             if e.code != 429 and e.code < 500:
@@ -74,8 +82,15 @@ def send(req, attempts=3):
                 except (ValueError, KeyError, TypeError):
                     pass
             err = e
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        # OSError, not TimeoutError: on Python 3.9 (macOS /usr/bin/python3) a read
+        # timeout is a bare socket.timeout, which only aliases TimeoutError from 3.10.
+        # URLError, ConnectionError and socket.timeout are all OSError subclasses.
+        except OSError as e:
             wait, err = 2 * n, e
+        if wait > MAX_RETRY_AFTER or time.monotonic() + wait >= DEADLINE:
+            print("telegram-send: giving up, a retry would wait {}s ({})".format(wait, err),
+                  file=sys.stderr)
+            break
         if n < attempts:
             print("telegram-send: attempt {} failed ({}), retrying".format(n, err),
                   file=sys.stderr)
