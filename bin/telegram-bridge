@@ -84,6 +84,8 @@ cmd_start() {
     sed -e "s|__HOME__|$HOME|g" \
         -e "s|__STATE_DIR__|$STATE_DIR|g" \
         -e "s|__TOKEN__|$token|g" \
+        -e "s|__TMUX_SOCKET__|${TELEGRAM_BRIDGE_TMUX_SOCKET:-default}|g" \
+        -e "s|__TMUX_SESSION__|${TELEGRAM_BRIDGE_TMUX_SESSION:-claude}|g" \
         "$PLIST_SOURCE" > "$PLIST_DEST"
     # The rendered plist contains the bot token in plaintext. Lock it down so it
     # isn't world/group readable (LaunchAgents land 644 by default). A better fix

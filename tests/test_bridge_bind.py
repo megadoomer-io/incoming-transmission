@@ -78,10 +78,22 @@ def test_write_registry_entry_defaults(tmp_path):
 
 def test_stamp_pane_issues_set_option(monkeypatch):
     calls = []
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
     monkeypatch.setattr(bridge_bind.subprocess, "run",
                         lambda argv, **kw: calls.append(argv))
     assert bridge_bind.stamp_pane("%5", 2103, tmux_bin="tmux") is True
     assert calls == [["tmux", "set-option", "-p", "-t", "%5", "@telegram_thread_id", "2103"]]
+
+
+def test_tmux_argv_inside_pane_follows_tmux_env(monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1/codeman,1,0")
+    assert bridge_bind.tmux_argv("tmux", socket="other") == ["tmux"]
+
+
+def test_tmux_argv_outside_tmux_names_socket(monkeypatch):
+    monkeypatch.delenv("TMUX", raising=False)
+    assert bridge_bind.tmux_argv("tmux", socket="codeman") == ["tmux", "-L", "codeman"]
+    assert bridge_bind.tmux_argv("tmux") == ["tmux", "-L", bridge_bind.TMUX_SOCKET]
 
 
 def test_stamp_pane_empty_pane_is_noop(monkeypatch):

@@ -301,6 +301,8 @@ into `~/.local/state/telegram-bridge/state.json` on first contact with the bot.
 | `TELEGRAM_BRIDGE_ALLOWED_USERNAME` | locks the bridge to your Telegram handle |
 | `INCOMING_TRANSMISSION_PREFIX` | install dir (default `~/.telegram-bridge`) |
 | `TELEGRAM_BRIDGE_TMUX` / `_CLAUDE` | override tmux / claude binary paths |
+| `TELEGRAM_BRIDGE_TMUX_SOCKET` | tmux socket (`-L`) for spawned sessions and the router (default `default`); baked into the daemon at `telegram-bridge start` |
+| `TELEGRAM_BRIDGE_TMUX_SESSION` | tmux session that spawns open windows in (default `claude`); baked in the same way |
 
 ## Daemon control
 
