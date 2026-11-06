@@ -122,3 +122,83 @@ def test_live_lock_blocks_concurrent_drain():
         assert "LOCKED" in blocked.stderr
     finally:
         _cleanup(t)
+
+
+# --- read.offset ran past a reset inbox (issue #32) -------------------------
+
+def test_offset_past_end_resets_and_delivers():
+    t = _thread("05")
+    _cleanup(t)
+    try:
+        sess = _sess(t)
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / "read.offset").write_text("576\n")
+        (sess / "inbox.jsonl").write_text('{"text":"stranded"}\n')
+
+        d = _run("drain", t)
+        assert d.returncode == 0
+        assert "stranded" in d.stdout
+        assert "desync" in d.stderr
+        assert (sess / "read.offset").read_text().strip() == "0"
+        assert (sess / ".drain-pending").read_text().strip() == "1"
+
+        a = _run("ack", t)
+        assert a.returncode == 0
+        assert (sess / "read.offset").read_text().strip() == "1"
+        assert not (sess / "poll.lock.d").is_dir()
+    finally:
+        _cleanup(t)
+
+
+def test_offset_past_missing_inbox_resets_and_releases():
+    t = _thread("06")
+    _cleanup(t)
+    try:
+        sess = _sess(t)
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / "read.offset").write_text("576\n")
+
+        d = _run("drain", t)
+        assert d.returncode == 0
+        assert d.stdout.strip() == ""
+        assert (sess / "read.offset").read_text().strip() == "0"
+        assert not (sess / "poll.lock.d").is_dir()
+    finally:
+        _cleanup(t)
+
+
+def test_offset_within_inbox_is_unchanged():
+    t = _thread("07")
+    _cleanup(t)
+    try:
+        sess = _sess(t)
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / "read.offset").write_text("1\n")
+        (sess / "inbox.jsonl").write_text('{"text":"old"}\n{"text":"new"}\n')
+
+        d = _run("drain", t)
+        assert d.returncode == 0
+        assert "new" in d.stdout and "old" not in d.stdout
+        assert d.stderr.strip() == ""
+        assert (sess / "read.offset").read_text().strip() == "1"
+        assert (sess / ".drain-pending").read_text().strip() == "2"
+    finally:
+        _cleanup(t)
+
+
+def test_offset_equal_to_inbox_is_empty_drain():
+    t = _thread("08")
+    _cleanup(t)
+    try:
+        sess = _sess(t)
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / "read.offset").write_text("2\n")
+        (sess / "inbox.jsonl").write_text('{"text":"a"}\n{"text":"b"}\n')
+
+        d = _run("drain", t)
+        assert d.returncode == 0
+        assert d.stdout.strip() == "" and d.stderr.strip() == ""
+        assert (sess / "read.offset").read_text().strip() == "2"
+        assert not (sess / "poll.lock.d").is_dir()
+    finally:
+        _cleanup(t)
