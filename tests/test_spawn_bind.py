@@ -32,10 +32,12 @@ pytestmark = pytest.mark.skipif(shutil.which("zsh") is None, reason="spawn.sh ne
 _FAKE_TMUX = """#!/usr/bin/env bash
 # Record argv, emulate the subcommands telegram-spawn.sh uses.
 echo "$@" >> "$FAKE_TMUX_LOG"
+[ "$1" = -L ] && shift 2   # socket flag precedes the subcommand
 case "$1" in
   has-session)              exit 0 ;;   # pretend the shared session exists
   new-window|new-session)   echo "%99" ;;   # -P -F '#{pane_id}' -> fake pane id
   display-message)          echo "4242" ;;  # '#{pane_pid}' -> fake claude pid
+  show-environment)         printf 'CLAUDECODE=1\nCODEMAN_PASSWORD=x\nKEEP=1\n' ;;  # leaked server env
 esac
 exit 0
 """
@@ -70,6 +72,8 @@ def test_spawn_attach_binds_programmatically(tmp_path):
         TELEGRAM_BRIDGE_CLAUDE=str(fakeclaude),
         TELEGRAM_BRIDGE_BOT_TOKEN="testtoken",
         FAKE_TMUX_LOG=str(log),
+        TELEGRAM_BRIDGE_TMUX_SOCKET="testsock",
+        TELEGRAM_BRIDGE_TMUX_SESSION="testsess",
     )
     r = subprocess.run(
         ["bash", str(SPAWN), "--attach", "9001", "--restore", "/dev/null", str(workdir)],
@@ -88,5 +92,9 @@ def test_spawn_attach_binds_programmatically(tmp_path):
 
     logtext = log.read_text()
     assert "-P -F #{pane_id}" in logtext                                  # pane-id capture
+    for sub in ("has-session", "new-window", "display-message", "set-option"):
+        assert "-L testsock " + sub in logtext                              # every call on the socket
+    assert "/usr/bin/env -u CLAUDECODE -u CODEMAN_PASSWORD PATH=" in logtext  # leaked server env dropped
+    assert "has-session -t =testsess" in logtext                            # configured session
     assert "set-option -p -t %99 @telegram_thread_id 9001" in logtext     # pane stamped
     assert "TELEGRAM_BRIDGE_THREAD_ID=9001" in logtext                    # race-free env binding

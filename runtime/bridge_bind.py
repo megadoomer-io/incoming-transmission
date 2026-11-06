@@ -28,7 +28,17 @@ import urllib.error
 import urllib.request
 
 TMUX_BIN = os.environ.get("TELEGRAM_BRIDGE_TMUX", "/opt/homebrew/bin/tmux")
+# tmux's default socket is named "default", so `-L default` matches a bare `tmux`.
+TMUX_SOCKET = os.environ.get("TELEGRAM_BRIDGE_TMUX_SOCKET", "default")
 PANE_OPTION = "@telegram_thread_id"
+
+
+def tmux_argv(tmux_bin=TMUX_BIN, socket=TMUX_SOCKET):
+    """argv prefix for a tmux call. Inside a pane, $TMUX already names the right
+    server; the configured socket is for callers outside tmux (router, spawn)."""
+    if os.environ.get("TMUX"):
+        return [tmux_bin]
+    return [tmux_bin, "-L", socket]
 STATE_DIR = os.environ.get(
     "TELEGRAM_BRIDGE_STATE_DIR",
     os.path.join(os.path.expanduser("~"), ".local", "state", "telegram-bridge"))
@@ -69,7 +79,7 @@ def stamp_pane(pane_id, thread_id, tmux_bin=TMUX_BIN):
     if not pane_id:
         return False
     try:
-        subprocess.run([tmux_bin, "set-option", "-p", "-t", pane_id,
+        subprocess.run([*tmux_argv(tmux_bin), "set-option", "-p", "-t", pane_id,
                         PANE_OPTION, str(thread_id)],
                        capture_output=True, timeout=10)
         return True
@@ -155,7 +165,7 @@ def _self_bind_main():
     # a pane from claude_pid by walking UP, so a pane-pid ancestor matches.
     try:
         pane_pid = subprocess.run(
-            [TMUX_BIN, "display-message", "-p", "-t", pane, "#{pane_pid}"],
+            [*tmux_argv(), "display-message", "-p", "-t", pane, "#{pane_pid}"],
             capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pane_pid = ""

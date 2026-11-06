@@ -30,6 +30,9 @@
 set -euo pipefail
 
 TMUX_BIN="${TELEGRAM_BRIDGE_TMUX:-/opt/homebrew/bin/tmux}"
+# Spawn runs from the launchd router, outside tmux, so it always names the socket.
+# "default" is tmux's own default socket name, matching a bare `tmux`.
+TMUX_CMD=("$TMUX_BIN" -L "${TELEGRAM_BRIDGE_TMUX_SOCKET:-default}")
 CLAUDE_BIN="${TELEGRAM_BRIDGE_CLAUDE:-/opt/homebrew/bin/claude}"
 ALIAS_FILE="${TELEGRAM_BRIDGE_DIR_ALIASES:-$HOME/.telegram-bridge/dir-aliases.json}"
 AUQ_MCP_CONFIG="${TELEGRAM_BRIDGE_AUQ_MCP_CONFIG:-$HOME/.telegram-bridge/telegram-auq-mcp.json}"
@@ -145,7 +148,7 @@ fi
 # charset filter. NOTE: the prefix MUST NOT contain ":" — tmux 3.7+ rejects a ":"
 # in a window name ("invalid window name"), which silently broke every spawn. The
 # code only ever targets windows by index or $TMUX_PANE, never by name.
-SHARED="claude"
+SHARED="${TELEGRAM_BRIDGE_TMUX_SESSION:-claude}"
 win="tg-$(basename "$dir" | tr -cd 'a-zA-Z0-9._-')"
 
 # The new session self-attaches: /telegram creates its own topic (named from the
@@ -266,7 +269,17 @@ esac
 # scopes these to THIS claude process only. (PATH must be here regardless: tmux
 # silently ignores `-e PATH=`, and the launchd daemon's PATH is minimal, so without
 # it the spawned claude's hooks fail with `node: command not found`.)
+# A tmux server keeps its starter's env as its global env. One started from inside a
+# Claude session (or by Codeman) carries Claude markers and Codeman vars that would
+# make the spawn look like a nested child; drop them. A server that isn't up yet
+# captures this process's env instead.
+ENV_UNSET=()
+while IFS= read -r v; do
+    ENV_UNSET+=(-u "$v")
+done < <({ "${TMUX_CMD[@]}" show-environment -g 2>/dev/null || env; } \
+    | grep -oE '^(CLAUDECODE|CLAUDE_[A-Z_]+|AI_AGENT|CODEMAN_[A-Z_]+)=' | tr -d = || true)
 ENV_WRAP=(
+    ${ENV_UNSET[@]+"${ENV_UNSET[@]}"}
     "PATH=$USER_PATH"
     "TELEGRAM_BRIDGE_BOT_TOKEN=$TELEGRAM_BRIDGE_BOT_TOKEN"
     "TELEGRAM_BRIDGE_SPAWNED=1"
@@ -322,19 +335,19 @@ fi
 # emptiness: a non-zero rc means creation actually failed (clean up the topic we
 # created); a zero rc with an empty pane id is pathological — warn but never tear
 # down a live session.
-if "$TMUX_BIN" has-session -t "=$SHARED" 2>/dev/null; then
+if "${TMUX_CMD[@]}" has-session -t "=$SHARED" 2>/dev/null; then
     # Target "=$SHARED:" — the EXACT session, trailing colon = "pick the next
     # free window index". A bare "-t $SHARED" makes new-window target index 0,
     # which fails ("create window failed: index 0 in use") once the session
     # already has a window 0 (base-index is 0).
     set +e
-    PANE_ID="$("$TMUX_BIN" new-window -t "=$SHARED:" -n "$win" -c "$dir" -P -F '#{pane_id}' \
+    PANE_ID="$("${TMUX_CMD[@]}" new-window -t "=$SHARED:" -n "$win" -c "$dir" -P -F '#{pane_id}' \
         /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt")"
     rc=$?
     set -e
 else
     set +e
-    PANE_ID="$("$TMUX_BIN" new-session -d -s "$SHARED" -n "$win" -c "$dir" -P -F '#{pane_id}' \
+    PANE_ID="$("${TMUX_CMD[@]}" new-session -d -s "$SHARED" -n "$win" -c "$dir" -P -F '#{pane_id}' \
         /usr/bin/env "${ENV_WRAP[@]}" "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" -- "$prompt")"
     rc=$?
     set -e
@@ -367,8 +380,8 @@ fi
 # the option isn't stamped — the env-var binding above still resolves the session.
 CLAUDE_PID=""
 if [ -n "$PANE_ID" ]; then
-    CLAUDE_PID="$("$TMUX_BIN" display-message -p -t "$PANE_ID" '#{pane_pid}' 2>/dev/null || true)"
-    "$TMUX_BIN" set-option -p -t "$PANE_ID" @telegram_thread_id "$THREAD_ID" 2>/dev/null || true
+    CLAUDE_PID="$("${TMUX_CMD[@]}" display-message -p -t "$PANE_ID" '#{pane_pid}' 2>/dev/null || true)"
+    "${TMUX_CMD[@]}" set-option -p -t "$PANE_ID" @telegram_thread_id "$THREAD_ID" 2>/dev/null || true
 else
     echo "telegram-spawn: WARNING could not capture pane id; pane option not stamped (env-var binding still applies)" >&2
 fi

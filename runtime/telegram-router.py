@@ -824,7 +824,7 @@ TMUX_SESSION = os.environ.get("TELEGRAM_BRIDGE_TMUX_SESSION", "claude")
 
 def _tmux(*args):
     try:
-        return subprocess.run([TMUX_BIN, *args], capture_output=True,
+        return subprocess.run([*bridge_bind.tmux_argv(TMUX_BIN), *args], capture_output=True,
                               text=True, timeout=10).stdout
     except Exception:
         return ""
@@ -857,7 +857,7 @@ def _pane_for_claude_pid(target_pid):
     has claude as a descendant. Walking UP from target_pid to the first pid that
     is a pane_pid handles both, and matches by pid identity (never by name), so a
     nudge can only ever reach the exact session that owns the topic."""
-    out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+    out = _tmux("list-panes", "-s", "-t", "=" + TMUX_SESSION,
                 "-F", "#{pane_id}\t#{pane_pid}")
     pane_by_pid = {}
     for line in out.splitlines():
@@ -904,7 +904,7 @@ def list_unattached_claude_panes():
     to that pane. Returns [(pane_id, window_index, label), ...], where label is the
     cwd basename (see _pane_label) — the readable project name you pick a session
     by, not the (process-tracked) window name."""
-    out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+    out = _tmux("list-panes", "-s", "-t", "=" + TMUX_SESSION,
                 "-F", "#{pane_id}\t#{window_index}\t#{window_name}\t"
                       "#{pane_current_command}\t#{pane_current_path}")
     claude_panes = []
@@ -994,7 +994,7 @@ def clear_stale_pane_options():
     started in that pane. Here the router unsets it programmatically on any pane in
     a DEAD-renamed window. Idempotent, cheap (one list-panes per sweep), never
     raises. (kill_old=true destroys the pane, so its option is already gone.)"""
-    out = _tmux("list-panes", "-s", "-t", TMUX_SESSION,
+    out = _tmux("list-panes", "-s", "-t", "=" + TMUX_SESSION,
                 "-F", "#{pane_id}\t#{window_name}\t#{@telegram_thread_id}")
     for pane_id in _stale_pane_ids(out):
         _tmux("set-option", "-pu", "-t", pane_id, "@telegram_thread_id")
@@ -1068,7 +1068,7 @@ def reap_stale_windows(chat_id):
     global _reap_seen
     cfg = load_compaction_cfg()
     grace = max(60, int(cfg.get("window_reap_grace_seconds", 3600) or 3600))
-    out = _tmux("list-windows", "-t", TMUX_SESSION,
+    out = _tmux("list-windows", "-t", "=" + TMUX_SESSION,
                 "-F", "#{window_id}\t#{window_name}\t#{pane_dead}")
     windows = []
     for line in out.splitlines():
