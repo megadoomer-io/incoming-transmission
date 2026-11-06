@@ -153,6 +153,12 @@ def test_bool_window_is_ignored(tmp_path, monkeypatch):
     assert data["pct"] == 0.1
 
 
+def test_empty_key_is_ignored(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, json.dumps({"model_windows": {"": 5}}))
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    assert ctx.compute(p)["window"] == ctx.WIDE_WINDOW
+
+
 def test_non_object_config_falls_back_to_guess(tmp_path, monkeypatch):
     for text in ("[]", json.dumps({"model_windows": [1, 2]}), "42"):
         _config(tmp_path, monkeypatch, text)
