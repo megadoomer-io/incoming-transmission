@@ -76,6 +76,14 @@ case "$CMD" in
         off="$(cat "$OFFSET" 2>/dev/null || echo 0)"
         total="$(wc -l 2>/dev/null < "$INBOX" | tr -d ' ' || echo 0)"
         off="${off:-0}"; total="${total:-0}"
+        if [ "$off" -gt "$total" ]; then
+            # The inbox was recreated smaller than the offset (e.g. /tmp cleanup), so
+            # tail would read past EOF forever. Reset to 0, not min(off,total): ack
+            # never truncates, so every line in a recreated inbox is unprocessed.
+            echo "telegram-inbox: read.offset desync ($off > $total lines); reset to 0" >&2
+            echo 0 > "$OFFSET"
+            off=0
+        fi
         if [ "$total" -le "$off" ]; then
             # Nothing new to hand off: release the lock we just took and require
             # NO ack. drain/ack is a lock handshake (drain acquires, ack releases),

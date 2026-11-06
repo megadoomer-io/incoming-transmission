@@ -574,6 +574,9 @@ def undrained_count(reg):
             offset = int((off_f.read_text().strip() or "0"))
         except (ValueError, OSError):
             offset = 0
+        if offset > total:
+            # Desync (inbox recreated smaller); drain resets to 0, so all lines wait.
+            offset = 0
         return max(0, total - offset)
     except OSError:
         return 0
