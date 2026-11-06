@@ -27,7 +27,10 @@
 # The allowlist has to track model renames: the Opus 5 family ("claude-opus-5-5")
 # was missed until 2026-10-21, so it was sized against 200k and compacted at ~17%
 # real usage, the same bug again. Observed opus-5-5 transcripts reach ~940k tokens,
-# which confirms the 1m window.
+# which confirms the 1m window. Fable 5 ("claude-fable-5-1") is 1m as well
+# (transcripts seen at 261k) and joined the list 2026-11-05. An optional
+# "model_windows" map in compaction.json ({"<id substring>": <tokens>}) overrides
+# this guess per model, so a rename can be fixed without a code change.
 #
 # Writes /tmp/claude-telegram/sessions/<thread>/status.json:
 #   {"pct":0.37,"tokens":372000,"window":1000000,"msgs":42,
@@ -54,7 +57,26 @@ SESSIONS_ROOT = Path("/tmp/claude-telegram/sessions")
 # Model-id substrings that mean a 1,000,000-token window. Matched case-insensitively
 # against the recorded model id. The tier is no longer in the id (see module
 # docstring), so this is a name-based allowlist, not a suffix check.
-WIDE_MODELS = ("opus-4-8", "opus-5")
+WIDE_MODELS = ("opus-4-8", "opus-5", "fable-5")
+CONFIG_FILE = Path(__file__).resolve().parent / "compaction.json"
+
+
+def configured_window(mid):
+    """Window from compaction.json's model_windows map, or None if unset, unmatched
+    or malformed. The longest matching key wins, so {"opus": .., "opus-5": ..}
+    sizes opus-5-5 by the "opus-5" entry whatever the file order."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    windows = cfg.get("model_windows") if isinstance(cfg, dict) else None
+    if not isinstance(windows, dict):
+        return None
+    # bool is an int subclass: reject true/false so they can't become the window.
+    matches = [k for k, size in windows.items()
+               if isinstance(k, str) and k.lower() in mid
+               and type(size) is int and size > 0]
+    return windows[max(matches, key=len)] if matches else None
 
 
 def compute(transcript_path):
@@ -95,7 +117,7 @@ def compute(transcript_path):
         or any(w in mid for w in WIDE_MODELS)
         or tokens > DEFAULT_WINDOW
     )
-    window = WIDE_WINDOW if wide else DEFAULT_WINDOW
+    window = configured_window(mid) or (WIDE_WINDOW if wide else DEFAULT_WINDOW)
     return {
         "pct": round(tokens / window, 4),
         "tokens": tokens,
