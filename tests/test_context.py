@@ -111,3 +111,50 @@ def test_no_usage_returns_none(tmp_path):
     p = tmp_path / "empty.jsonl"
     p.write_text("")
     assert ctx.compute(p) is None
+
+
+def test_fable_5_is_wide(tmp_path):
+    # Fable 5 / 5.1 are 1m models; below 200k only the allowlist sizes them right.
+    p = _write_transcript(tmp_path, [("claude-fable-5-1", 170_000)])
+    assert ctx.compute(p)["window"] == ctx.WIDE_WINDOW
+
+
+def _config(tmp_path, monkeypatch, text):
+    cfg = tmp_path / "compaction.json"
+    cfg.write_text(text)
+    monkeypatch.setattr(ctx, "CONFIG_FILE", cfg)
+
+
+def test_model_windows_config_overrides_guess(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, json.dumps({"model_windows": {"opus-5-5": 500_000}}))
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    data = ctx.compute(p)
+    assert data["window"] == 500_000
+    assert data["pct"] == round(100_000 / 500_000, 4)
+
+
+def test_model_windows_longest_match_wins(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, json.dumps({"model_windows": {"opus": 200_000, "opus-5": 1_000_000}}))
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    assert ctx.compute(p)["window"] == 1_000_000
+
+
+def test_bad_config_falls_back_to_guess(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, "{not json")
+    p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+    assert ctx.compute(p)["window"] == ctx.WIDE_WINDOW
+
+
+def test_bool_window_is_ignored(tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, json.dumps({"model_windows": {"fable": True}}))
+    p = _write_transcript(tmp_path, [("claude-fable-5-1", 100_000)])
+    data = ctx.compute(p)
+    assert data["window"] == ctx.WIDE_WINDOW
+    assert data["pct"] == 0.1
+
+
+def test_non_object_config_falls_back_to_guess(tmp_path, monkeypatch):
+    for text in ("[]", json.dumps({"model_windows": [1, 2]}), "42"):
+        _config(tmp_path, monkeypatch, text)
+        p = _write_transcript(tmp_path, [("claude-opus-5-5", 100_000)])
+        assert ctx.compute(p)["window"] == ctx.WIDE_WINDOW
