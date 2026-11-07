@@ -189,6 +189,9 @@ the skill):
        "Bash(~/.telegram-bridge/telegram-send.sh:*)"
    ] } }
    ```
+   Replies pass the text on stdin (`telegram-send.sh <chat> <thread> - <<'TG_REPLY_END'`),
+   so `$`, backticks and quotes in a reply are sent as typed; a plain `<text>` argument
+   still works for short fixed strings.
    Each drain is `telegram-inbox.sh drain|ack <thread>` + `telegram-send.sh` replies —
    a fixed, allowlistable command set instead of per-call bash whose `$(...)` /
    variable expansion would dodge the allowlist and prompt you on every housekeeping
