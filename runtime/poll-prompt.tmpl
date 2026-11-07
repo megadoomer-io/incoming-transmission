@@ -40,10 +40,13 @@ A. DRAIN INBOX (run whenever a wake nudge tells you to drain):
       c. else treat text as a task/question for THIS session.
       d. Process with full context, tools, memory.
       e. Reply with the text on stdin through a QUOTED heredoc, so $, backticks and quotes
-         in your reply reach the phone as typed (a double-quoted argument expands them):
-           ~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} - <<'EOF'
-           <your response>
-           EOF
+         in your reply reach the phone as typed (a double-quoted argument expands them).
+         Use exactly this terminator, alone at the START of its line, no indent:
+~/.telegram-bridge/telegram-send.sh {{CHAT_ID}} {{THREAD_ID}} - <<'TG_REPLY_END'
+<your response>
+TG_REPLY_END
+         (Not EOF: a reply containing a line that is just "EOF" would end the heredoc
+         early and the shell would run the rest of the reply as commands.)
       f. BRIDGE COMMANDS — first token is one of these RESERVED names, leading "/"
          (preferred) or "!" (legacy), case-insensitive; strip the prefix first:
            /status  -> reply with cwd + message count processed

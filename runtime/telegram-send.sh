@@ -2,8 +2,11 @@
 # Send a message to a Telegram chat/topic via the Bot API.
 # Usage: telegram-send.sh <chat_id> <thread_id|-> <text|->
 #   thread_id "-" or "general" sends to the General topic (no thread).
-#   text "-" reads the message from stdin, so a quoted heredoc (<<'EOF') can
-#   carry "$" and backticks without the calling shell expanding them.
+#   text "-" reads the message from stdin, so a quoted heredoc
+#   (<<'TG_REPLY_END') can carry "$" and backticks without the calling shell
+#   expanding them.
+# On a failure after some chunks went out it prints "sent K/N chunks" so a caller
+# can resend only the rest.
 # Retries timeouts, connection resets, 429 and 5xx (3 attempts, backoff).
 # Reads TELEGRAM_BRIDGE_BOT_TOKEN from the environment (never an argv).
 # Chunks text to Telegram's 4096-char limit. Plain text, no parse_mode.
@@ -14,9 +17,10 @@ if [[ -z "${TELEGRAM_BRIDGE_BOT_TOKEN:-}" ]]; then
     exit 1
 fi
 
-chat_id="${1:?usage: telegram-send.sh <chat_id> <thread_id|-> <text>}"
-thread_id="${2:?usage: telegram-send.sh <chat_id> <thread_id|-> <text>}"
-text="${3:?usage: telegram-send.sh <chat_id> <thread_id|-> <text>}"
+usage="usage: telegram-send.sh <chat_id> <thread_id|-> <text|-> (- reads the text from stdin)"
+chat_id="${1:?$usage}"
+thread_id="${2:?$usage}"
+text="${3:?$usage}"
 # python3 below reads its program from a heredoc on stdin, so slurp ours here.
 if [[ "$text" == "-" ]]; then
     text="$(cat)"
@@ -73,13 +77,13 @@ def send(req, attempts=3):
             if e.code != 429 and e.code < 500:
                 try:
                     return json.load(e)
-                except ValueError:
+                except (ValueError, OSError):
                     return {"ok": False, "error_code": e.code}
             wait = 2 * n
             if e.code == 429:
                 try:
                     wait = int(json.load(e)["parameters"]["retry_after"])
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, OSError):
                     pass
             err = e
         # OSError, not TimeoutError: on Python 3.9 (macOS /usr/bin/python3) a read
@@ -96,11 +100,17 @@ def send(req, attempts=3):
                   file=sys.stderr)
             time.sleep(wait)
     print("telegram-send: request failed: {}".format(err), file=sys.stderr)
+    return None
+
+
+def fail(sent):
+    if len(chunks) > 1:
+        print("telegram-send: sent {}/{} chunks".format(sent, len(chunks)), file=sys.stderr)
     sys.exit(1)
 
 
 chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
-for chunk in chunks:
+for sent, chunk in enumerate(chunks):
     payload = {"chat_id": chat, "text": chunk, "disable_web_page_preview": True}
     if thread not in ("-", "general", ""):
         payload["message_thread_id"] = int(thread)
@@ -108,8 +118,10 @@ for chunk in chunks:
     req = urllib.request.Request(api, data=data,
                                  headers={"Content-Type": "application/json"})
     resp = send(req)
+    if resp is None:
+        fail(sent)
     if not resp.get("ok"):
         print("telegram-send: API error: {}".format(resp), file=sys.stderr)
-        sys.exit(1)
+        fail(sent)
     record_sent(resp.get("result", {}).get("message_id"))
 PY
