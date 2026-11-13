@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/megadoomer-io/incoming-transmission/compare/v1.1.1...v1.2.0) (2026-11-13)
+
+
+### Features
+
+* **tmux:** add TELEGRAM_BRIDGE_TMUX_SOCKET to run on a non-default tmux server ([#55](https://github.com/megadoomer-io/incoming-transmission/issues/55)) ([293d2c0](https://github.com/megadoomer-io/incoming-transmission/commit/293d2c05b3edef5d7235f1c95f72f2f8f6bd8dd9))
+
+
+### Bug Fixes
+
+* **context:** ignore an empty model_windows key ([#53](https://github.com/megadoomer-io/incoming-transmission/issues/53)) ([8eedbc0](https://github.com/megadoomer-io/incoming-transmission/commit/8eedbc0e9b47093de7ff796a898af418a43ce9cf))
+* **context:** size fable-5 as a 1m window and add model_windows override ([#39](https://github.com/megadoomer-io/incoming-transmission/issues/39)) ([fd9cd84](https://github.com/megadoomer-io/incoming-transmission/commit/fd9cd847f0e97f6d010594559cef65b4b78d358b))
+* **inbox:** reset read.offset when it runs past a recreated inbox ([#54](https://github.com/megadoomer-io/incoming-transmission/issues/54)) ([96cfc52](https://github.com/megadoomer-io/incoming-transmission/commit/96cfc5276bb33ea0d9dd7f9dabe063bc4b09e4ba))
+
 ## [1.1.1](https://github.com/megadoomer-io/incoming-transmission/compare/v1.1.0...v1.1.1) (2026-10-22)
 
 
